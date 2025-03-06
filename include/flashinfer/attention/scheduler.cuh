@@ -1115,7 +1115,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     } else if (x <= 64) {
       return 192;
     }
-    return ceil_div(x, 256) * 256;
+    return ceil_div(x, 32) * 32;
   };
 
   int kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), 1L));
@@ -1165,6 +1165,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         int num_qo_chunks = std::max(remaining_len * cluster_size / kv_len_limit, 1);
         // row_chunk_size * num_qo_chunks >= row_tile_size
         int row_chunk_size = ceil_div(row_tile_size, num_qo_chunks);
+        std::cout << "row_chunk_size: " << row_chunk_size << std::endl;
         int current_q_tile_end =
             std::min(cluster_tile_q, packed_qo_len - qo_tile_idx * cluster_tile_q);
         for (int offset_start = 0; offset_start < row_tile_size; offset_start += row_chunk_size) {
@@ -1176,9 +1177,11 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
           merge_partial_packed_offset_start[merge_cta_counter] = partial_o_nnz + offset_start;
           merge_partial_packed_offset_end[merge_cta_counter] =
               partial_o_nnz + ceil_div(remaining_len, kv_len_limit) * row_tile_size;
+          std::cout << ceil_div(remaining_len, kv_len_limit) << std::endl;
           merge_partial_stride[merge_cta_counter] = row_tile_size;
           merge_cta_counter++;
         }
+        std::cout << "merge_cta_counter: " << merge_cta_counter << std::endl;
       }
       bool zero_kv_len = (remaining_len == 0);
       while (remaining_len > 0 || zero_kv_len) {
