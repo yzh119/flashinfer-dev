@@ -359,6 +359,11 @@ def is_sm90a_supported(device: torch.device) -> bool:
     return major == 9 and torch.version.cuda >= "12.3"
 
 
+def is_sm100a_supported(device: torch.device) -> bool:
+    major, _ = get_compute_capability(device)
+    return major == 10 and torch.version.cuda >= "12.8"
+
+
 def determine_mla_backend(device: torch.device) -> str:
     return "fa3" if is_sm90a_supported(device) else "fa2"
 
