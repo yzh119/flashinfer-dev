@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from types import SimpleNamespace
 from typing import Optional
 
@@ -138,6 +139,23 @@ def get_gemm_module():
         )
 
     return _gemm_module
+
+
+@functools.cache
+def get_gemm_sm100_module():
+    if has_prebuilt_ops:
+        _kernels_sm100 = torch.ops.flashinfer_kernels_sm100
+        module = _kernels_sm100
+    else:
+        module = load_cuda_ops(
+            "gemm_sm100",
+            [
+                FLASHINFER_CSRC_DIR / "gemm_blockwise_sm100.cu",
+            ],
+            extra_cuda_cflags=["-gencode", "arch=compute_100a,code=sm_100a"],
+        )
+
+    return module
 
 
 def get_gemm_sm90_module():
@@ -673,3 +691,15 @@ def bmm_fp8(
     workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
     get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
     return out
+
+
+def gemm_fp8_nt_blockscaled(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    SFA: torch.Tensor,
+    SFB: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    workspace_buffer: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    module = get_gemm_sm100_module()

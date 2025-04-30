@@ -16,6 +16,7 @@
 #ifndef FLASHINFER_GEMM_BLOCKWISE_SM100_CUH_
 #define FLASHINFER_GEMM_BLOCKWISE_SM100_CUH_
 
+#include "../allocator.h"
 #include "../cutlass_utils.cuh"
 #include "../utils.cuh"
 
@@ -24,9 +25,10 @@ namespace flashinfer {
 namespace gemm {
 
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassBlockwiseScaledGEMMSM100(
-
-) {
+cudaError_t CutlassBlockwiseScaledGEMMSM100(void* float_buffer, size_t float_buffer_size_in_bytes,
+                                            DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
+                                            float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k,
+                                            int l, cudaStream_t stream) {
   using ElementA = cutlass::float_e4m3_t;     // Element type for A matrix operand
   using LayoutA = cutlass::layout::RowMajor;  // Layout type for A matrix operand
   constexpr int AlignmentA =
@@ -34,7 +36,7 @@ cudaError_t CutlassBlockwiseScaledGEMMSM100(
                                                     // matrix in units of elements (up to 16 bytes)
 
   // B matrix configuration
-  using ElementB = cutlass::float_e4m3_t;        // Element type for B matrix operand
+  using ElementB = cutlass::bfloat16_t;          // Element type for B matrix operand
   using LayoutB = cutlass::layout::ColumnMajor;  // Layout type for B matrix operand
   constexpr int AlignmentB =
       128 / cutlass::sizeof_bits<ElementB>::value;  // Memory access granularity/alignment of A
@@ -89,6 +91,48 @@ cudaError_t CutlassBlockwiseScaledGEMMSM100(
   using StrideB = typename Gemm::GemmKernel::StrideB;
   using StrideC = typename Gemm::GemmKernel::StrideC;
   using StrideD = typename Gemm::GemmKernel::StrideD;
+
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, l));
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, l));
+  auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, l));
+  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, l));
+
+  auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, l));
+  auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, l));
+
+  typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGemm,
+                                     {m, n, k, l},
+                                     {
+                                         ptr_A,
+                                         stride_A,
+                                         ptr_B,
+                                         stride_B,
+                                         ptr_SFA,
+                                         layout_SFA,
+                                         ptr_SFB,
+                                         layout_SFB,
+                                     },
+                                     {
+                                         {},  // epilogue.thread
+                                         ptr_C,
+                                         stride_C,
+                                         ptr_C,
+                                         stride_C,
+                                     }};
+  auto& fusion_args = arguments.epilogue.thread;
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+
+  Gemm gemm;
+
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+  AlignedAllocator float_allocator(float_buffer, float_buffer_size_in_bytes);
+  auto workspace_ptr = float_allocator.aligned_alloc<void>(workspace_size, 64,
+                                                           "sm100_blockwise_gemm_float_workspace");
+
+  CUTLASS_CHECK(gemm.can_implement(arguments));
+  CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));
+  CUTLASS_CHECK(gemm.run(stream));
 }
 
 }  // namespace gemm
