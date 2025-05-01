@@ -24,27 +24,29 @@ namespace flashinfer {
 
 namespace gemm {
 
+using namespace cute;
+
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassBlockwiseScaledGEMMSM100(void* float_buffer, size_t float_buffer_size_in_bytes,
                                             DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
                                             float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k,
                                             int l, cudaStream_t stream) {
-  using ElementA = cutlass::float_e4m3_t;     // Element type for A matrix operand
+  using ElementA = DTypeIn;                   // Element type for A matrix operand
   using LayoutA = cutlass::layout::RowMajor;  // Layout type for A matrix operand
   constexpr int AlignmentA =
       128 / cutlass::sizeof_bits<ElementA>::value;  // Memory access granularity/alignment of A
                                                     // matrix in units of elements (up to 16 bytes)
 
   // B matrix configuration
-  using ElementB = cutlass::bfloat16_t;          // Element type for B matrix operand
+  using ElementB = DTypeIn;                      // Element type for B matrix operand
   using LayoutB = cutlass::layout::ColumnMajor;  // Layout type for B matrix operand
   constexpr int AlignmentB =
       128 / cutlass::sizeof_bits<ElementB>::value;  // Memory access granularity/alignment of A
                                                     // matrix in units of elements (up to 16 bytes)
 
   // C/D matrix configuration
-  using ElementC = cutlass::float_e4m3_t;        // Element type for C and D matrix operands
-  using LayoutC = cutlass::layout::ColumnMajor;  // Layout type for C and D matrix operands
+  using ElementC = DTypeOut;                  // Element type for C and D matrix operands
+  using LayoutC = cutlass::layout::RowMajor;  // Layout type for C and D matrix operands
   constexpr int AlignmentC =
       128 / cutlass::sizeof_bits<ElementC>::value;  // Memory access granularity/alignment of A
                                                     // matrix in units of elements (up to 16 bytes)
@@ -103,20 +105,20 @@ cudaError_t CutlassBlockwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
   typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGemm,
                                      {m, n, k, l},
                                      {
-                                         ptr_A,
+                                         A_ptr,
                                          stride_A,
-                                         ptr_B,
+                                         B_ptr,
                                          stride_B,
-                                         ptr_SFA,
+                                         SFA_ptr,
                                          layout_SFA,
-                                         ptr_SFB,
+                                         SFB_ptr,
                                          layout_SFB,
                                      },
                                      {
                                          {},  // epilogue.thread
-                                         ptr_C,
+                                         C_ptr,
                                          stride_C,
-                                         ptr_C,
+                                         C_ptr,
                                          stride_C,
                                      }};
   auto& fusion_args = arguments.epilogue.thread;
@@ -127,12 +129,13 @@ cudaError_t CutlassBlockwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
   AlignedAllocator float_allocator(float_buffer, float_buffer_size_in_bytes);
-  auto workspace_ptr = float_allocator.aligned_alloc<void>(workspace_size, 64,
+  auto workspace_ptr = float_allocator.aligned_alloc<void>(workspace_size, 32 * 1024 * 1024,
                                                            "sm100_blockwise_gemm_float_workspace");
 
   CUTLASS_CHECK(gemm.can_implement(arguments));
   CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));
   CUTLASS_CHECK(gemm.run(stream));
+  return cudaSuccess;
 }
 
 }  // namespace gemm

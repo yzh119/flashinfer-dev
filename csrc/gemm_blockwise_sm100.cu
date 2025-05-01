@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <flashinfer/cutlass_utils.cuh>
+#include <flashinfer/gemm/gemm_blockwise_sm100.cuh>
 
 #include "pytorch_extension_utils.h"
 
@@ -36,9 +37,11 @@ void CutlassGemmBlockwiseScaledSM100(at::Tensor float_workspace_buffer, at::Tens
     using cutlass_t_in = cutlass_dtype_t<c_type_in>;
     using cutlass_t_out = cutlass_dtype_t<c_type_out>;
     auto status = flashinfer::gemm::CutlassBlockwiseScaledGEMMSM100(
-        float_workspace_buffer.data_ptr(),
-        float_workspace_buffer.element_size() * float_workspace_buffer.size(0), A.data_ptr(),
-        B.data_ptr(), SFA.data_ptr(), SFB.data_ptr(), C.data_ptr(), stream);
+        static_cast<float*>(float_workspace_buffer.data_ptr()),
+        float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
+        static_cast<cutlass_t_in*>(A.data_ptr()), static_cast<cutlass_t_in*>(B.data_ptr()),
+        static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
+        static_cast<cutlass_t_out*>(C.data_ptr()), A.size(0), B.size(0), A.size(1), 1, stream);
     return true;
   });
 }
