@@ -533,41 +533,38 @@ def main():
                 jit_env.SPDLOG_INCLUDE_DIR,
                 jit_env.FLASHINFER_INCLUDE_DIR,
             ],
-        )
+        ),
+        gen_jit_spec(
+            "trtllm_utils",
+            [
+                jit_env.FLASHINFER_CSRC_DIR
+                / "nv_internal"
+                / "tensorrt_llm"
+                / "kernels"
+                / "delayStream.cu",
+            ],
+            extra_include_paths=[
+                jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+                jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+                jit_env.FLASHINFER_CSRC_DIR
+                / "nv_internal"
+                / "tensorrt_llm"
+                / "cutlass_extensions"
+                / "include",
+                jit_env.FLASHINFER_CSRC_DIR
+                / "nv_internal"
+                / "tensorrt_llm"
+                / "kernels"
+                / "internal_cutlass_kernels"
+                / "include",
+                jit_env.FLASHINFER_CSRC_DIR
+                / "nv_internal"
+                / "tensorrt_llm"
+                / "kernels"
+                / "internal_cutlass_kernels",
+            ],
+        ),
     ]
-    if has_sm90:
-        jit_specs.append(
-            gen_jit_spec(
-                "trtllm_utils",
-                [
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "kernels"
-                    / "delayStream.cu",
-                ],
-                extra_include_paths=[
-                    jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-                    jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "cutlass_extensions"
-                    / "include",
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "kernels"
-                    / "internal_cutlass_kernels"
-                    / "include",
-                    jit_env.FLASHINFER_CSRC_DIR
-                    / "nv_internal"
-                    / "tensorrt_llm"
-                    / "kernels"
-                    / "internal_cutlass_kernels",
-                ],
-            ),
-        )
     jit_specs += gen_all_modules(
         f16_dtype_,
         f8_dtype_,
