@@ -20,9 +20,13 @@ struct AttentionSink : AttentionVariantBase {
                                    uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
-    window_left = kv_len;
+    window_left = (params.window_left >= 0) ? params.window_left : kv_len;
     sm_scale_log2 = params.sm_scale * math::log2e;
   }
+
+  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    return (kv_idx + qo_len + window_left >= kv_len + qo_idx);
+  })
 
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
     float log_sink = math::ptx_log2(params.sink[qo_head_idx]);
@@ -58,6 +62,7 @@ def sink_attention_ref(
     k: torch.Tensor,
     v: torch.Tensor,
     sink: torch.Tensor,
+    window_left: bool,
     causal: bool,
     sm_scale: float,
 ) -> torch.Tensor:
@@ -85,8 +90,16 @@ def sink_attention_ref(
         mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
             1
         ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+        if window_left >= 0:
+            row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
+            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+            mask &= row_idx - window_left <= col_idx
     else:
         mask = torch.ones(qo_len, kv_len, device=q.device)
+        if window_left >= 0:
+            row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
+            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+            mask = row_idx - window_left <= col_idx
 
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
 
@@ -110,8 +123,11 @@ def sink_attention_ref(
 @pytest.mark.parametrize("seq_len", [1024])
 @pytest.mark.parametrize("num_qo_heads", [8])
 @pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("causal", [True, False])
-def test_attention_sink(dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, causal):
+def test_attention_sink(
+    dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, window_left, causal
+):
     jit_args = (
         f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}",  # uri
         dtype,  # dtype_q
@@ -150,6 +166,7 @@ def test_attention_sink(dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, 
         num_kv_heads,
         head_dim,
         causal=causal,
+        window_left=window_left,
         q_data_type=dtype,
         kv_data_type=dtype,
     )
@@ -180,7 +197,7 @@ def test_attention_sink(dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, 
 
     o = wrapper.run(q, k, v, sink, sm_scale)
     o_ref = sink_attention_ref(
-        batch_size, q, k, v, sink, causal=causal, sm_scale=sm_scale
+        batch_size, q, k, v, sink, window_left, causal=causal, sm_scale=sm_scale
     )
     if dtype == torch.float16:
         torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
@@ -206,6 +223,7 @@ def test_attention_sink(dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, 
         head_dim,
         1,
         causal=causal,
+        window_left=window_left,
         q_data_type=dtype,
         kv_data_type=dtype,
     )
@@ -223,5 +241,6 @@ if __name__ == "__main__":
         seq_len=1024,
         num_qo_heads=32,
         num_kv_heads=32,
+        window_left=128,
         causal=False,
     )
