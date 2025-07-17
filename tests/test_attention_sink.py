@@ -25,8 +25,12 @@ struct AttentionSink : AttentionVariantBase {
   }
 
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
-    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d + params.sink[qo_head_idx]) : 0.f;
-    return output * d_rcp;
+    float log_sink = math::ptx_log2(params.sink[qo_head_idx]);
+    float m_all = (log_sink > m) ? log_sink : m;
+    float scale = math::ptx_exp2(m - m_all);
+    float d_all = d * scale;
+    float denom = math::ptx_exp2(log_sink - m_all) + d_all;
+    return (output * scale) * math::ptx_rcp(denom);
   });
 };
 """
@@ -151,14 +155,14 @@ def test_attention_sink(dtype, causal):
         dtype=dtype,
         device="cuda",
     )
-    k = torch.zeros(
+    k = torch.randn(
         batch_size * seq_len_per_request,
         num_kv_heads,
         head_dim,
         dtype=dtype,
         device="cuda",
     )
-    v = torch.ones(
+    v = torch.randn(
         batch_size * seq_len_per_request,
         num_kv_heads,
         head_dim,
