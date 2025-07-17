@@ -64,6 +64,12 @@ def sink_attention_ref(
     qo_len = q.shape[0] // batch_size
     kv_len = k.shape[0] // batch_size
     num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    if num_qo_heads != num_kv_heads:
+        # repeat interleave kv
+        k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=1)
+        v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=1)
+
     head_dim_qk = q.shape[2]
     head_dim_vo = v.shape[2]
     logits = (
@@ -100,8 +106,12 @@ def sink_attention_ref(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # , torch.bfloat16])
-@pytest.mark.parametrize("causal", [False])  # [True, False])
-def test_attention_sink(dtype, causal):
+@pytest.mark.parametrize("batch_size", [1, 128])
+@pytest.mark.parametrize("seq_len", [1024])
+@pytest.mark.parametrize("num_qo_heads", [8])
+@pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("causal", [True, False])
+def test_attention_sink(dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, causal):
     jit_args = (
         f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}",  # uri
         dtype,  # dtype_q
@@ -124,17 +134,13 @@ def test_attention_sink(dtype, causal):
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
     )
-    batch_size = 128
-    seq_len_per_request = 1024
     qo_indptr_host = torch.arange(
-        0, batch_size * seq_len_per_request + 1, seq_len_per_request, dtype=torch.int32
+        0, batch_size * seq_len + 1, seq_len, dtype=torch.int32
     )
     kv_indptr_host = torch.arange(
-        0, batch_size * seq_len_per_request + 1, seq_len_per_request, dtype=torch.int32
+        0, batch_size * seq_len + 1, seq_len, dtype=torch.int32
     )
 
-    num_qo_heads = 32
-    num_kv_heads = 32
     head_dim = 128
 
     wrapper.plan(
@@ -149,21 +155,21 @@ def test_attention_sink(dtype, causal):
     )
 
     q = torch.randn(
-        batch_size * seq_len_per_request,
+        batch_size * seq_len,
         num_qo_heads,
         head_dim,
         dtype=dtype,
         device="cuda",
     )
     k = torch.randn(
-        batch_size * seq_len_per_request,
+        batch_size * seq_len,
         num_kv_heads,
         head_dim,
         dtype=dtype,
         device="cuda",
     )
     v = torch.randn(
-        batch_size * seq_len_per_request,
+        batch_size * seq_len,
         num_kv_heads,
         head_dim,
         dtype=dtype,
@@ -186,7 +192,7 @@ def test_attention_sink(dtype, causal):
     )
     kv_indices_host = torch.arange(
         0,
-        batch_size * seq_len_per_request,
+        batch_size * seq_len,
         dtype=torch.int32,
     )
     paged_kv_last_page_len_host = torch.full((batch_size,), 1, dtype=torch.int32)
@@ -211,4 +217,11 @@ def test_attention_sink(dtype, causal):
 
 
 if __name__ == "__main__":
-    test_attention_sink(torch.float16, True)
+    test_attention_sink(
+        torch.float16,
+        batch_size=128,
+        seq_len=1024,
+        num_qo_heads=32,
+        num_kv_heads=32,
+        causal=False,
+    )
