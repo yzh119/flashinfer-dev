@@ -118,12 +118,82 @@ def sink_attention_ref(
     return o_ref
 
 
+def sink_attention_incremental_ref(
+    q: torch.Tensor,  # [batch_size, num_qo_heads, head_dim] - single query token
+    k_cache: torch.Tensor,  # [batch_size, kv_len, num_kv_heads, head_dim] - accumulated KV cache
+    v_cache: torch.Tensor,  # [batch_size, kv_len, num_kv_heads, head_dim] - accumulated KV cache
+    sink: torch.Tensor,
+    window_left: int,
+    causal: bool,
+    sm_scale: float,
+) -> torch.Tensor:
+    """
+    Reference implementation for incremental generation: q_len=1, kv_len is the historical length
+    """
+    batch_size = q.shape[0]
+    qo_len = 1  # Always 1 during incremental generation
+    kv_len = k_cache.shape[1]
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k_cache.shape[2]
+
+    if num_qo_heads != num_kv_heads:
+        # repeat interleave kv
+        k_cache = torch.repeat_interleave(k_cache, num_qo_heads // num_kv_heads, dim=2)
+        v_cache = torch.repeat_interleave(v_cache, num_qo_heads // num_kv_heads, dim=2)
+        num_kv_heads = num_qo_heads
+
+    head_dim_qk = q.shape[2]
+    head_dim_vo = v_cache.shape[3]
+
+    # Calculate attention logits: [batch_size, num_heads, 1, kv_len]
+    logits = (
+        torch.einsum(
+            "bhd,blhd->bhl",
+            q.float(),  # [batch_size, num_heads, head_dim]
+            k_cache.float(),  # [batch_size, kv_len, num_heads, head_dim]
+        ).unsqueeze(2)  # Add seq_len=1 dimension -> [batch_size, num_heads, 1, kv_len]
+        * sm_scale
+    )
+
+    # Build mask for incremental generation scenario
+    if causal:
+        # For incremental generation, new token can attend to all previous tokens
+        mask = torch.ones(1, kv_len, device=q.device, dtype=torch.bool)
+        if window_left >= 0:
+            # Apply sliding window: can only see tokens within window_left range
+            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)
+            mask = (kv_len - 1 - window_left) <= col_idx  # Current position is kv_len-1
+    else:
+        mask = torch.ones(1, kv_len, device=q.device, dtype=torch.bool)
+        if window_left >= 0:
+            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)
+            mask = (kv_len - 1 - window_left) <= col_idx
+
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+
+    # Apply sink softmax
+    p = sink_softmax(logits, sink)  # [batch_size, num_heads, 1, kv_len]
+
+    # Calculate output
+    o_ref = (
+        torch.einsum(
+            "bhml,blhd->bhd",
+            p,  # [batch_size, num_heads, 1, kv_len]
+            v_cache.float(),  # [batch_size, kv_len, num_heads, head_dim]
+        )
+        .contiguous()
+        .to(q)  # [batch_size, num_heads, head_dim]
+    )
+
+    return o_ref
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # , torch.bfloat16])
-@pytest.mark.parametrize("batch_size", [1, 128])
-@pytest.mark.parametrize("seq_len", [1024])
-@pytest.mark.parametrize("num_qo_heads", [8])
-@pytest.mark.parametrize("num_kv_heads", [8])
-@pytest.mark.parametrize("window_left", [-1, 128])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
+@pytest.mark.parametrize("seq_len", [1, 4, 16, 128, 1024])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [8, 32])
+@pytest.mark.parametrize("window_left", [-1, 127, 128])
 @pytest.mark.parametrize("causal", [True, False])
 def test_attention_sink(
     dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, window_left, causal
@@ -232,6 +302,163 @@ def test_attention_sink(
         torch.testing.assert_close(o_paged, o_ref, rtol=1e-3, atol=1e-3)
     else:
         torch.testing.assert_close(o_paged, o_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("initial_seq_len", [32, 128, 512])
+@pytest.mark.parametrize("num_generation_steps", [1, 2, 4])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [8,32])
+@pytest.mark.parametrize("window_left", [-1, 127, 128])
+@pytest.mark.parametrize("causal", [True, False])
+def test_attention_sink_incremental_generation(
+    dtype, batch_size, initial_seq_len, num_generation_steps,
+    num_qo_heads, num_kv_heads, window_left, causal
+):
+    """
+    Test incremental generation scenario: q_len=1, kv_len grows gradually
+    Simulate the token-by-token generation process in real large model inference
+    """
+    head_dim = 128
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    # Create JIT arguments
+    jit_args = (
+        f"single_prefill_attention_sink_{filename_safe_dtype_map[dtype]}",
+        dtype, dtype, dtype, torch.int32,
+        head_dim, head_dim,
+        ["sink"], ["float"],
+        ["sm_scale"], ["double"],
+        "AttentionSink",
+        attention_sink_decl,
+    )
+
+    float_workspace_buffer = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+    )
+
+    # Initialize KV cache - simulate state after prefill phase
+    k_cache = torch.randn(
+        batch_size, initial_seq_len, num_kv_heads, head_dim,
+        dtype=dtype, device="cuda"
+    )
+    v_cache = torch.randn(
+        batch_size, initial_seq_len, num_kv_heads, head_dim,
+        dtype=dtype, device="cuda"
+    )
+
+    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 100
+
+    # Simulate incremental generation process
+    for step in range(num_generation_steps):
+        current_kv_len = initial_seq_len + step
+
+        # Current generated new token (q_len=1)
+        q_new = torch.randn(
+            batch_size, num_qo_heads, head_dim,
+            dtype=dtype, device="cuda"
+        )
+
+        # K,V for newly generated token
+        k_new = torch.randn(
+            batch_size, 1, num_kv_heads, head_dim,
+            dtype=dtype, device="cuda"
+        )
+        v_new = torch.randn(
+            batch_size, 1, num_kv_heads, head_dim,
+            dtype=dtype, device="cuda"
+        )
+
+        # Update KV cache
+        if step == 0:
+            k_cache_current = k_cache
+            v_cache_current = v_cache
+        else:
+            k_cache_current = torch.cat([k_cache, k_accumulated], dim=1)
+            v_cache_current = torch.cat([v_cache, v_accumulated], dim=1)
+
+        # Calculate reference result
+        o_ref = sink_attention_incremental_ref(
+            q_new, k_cache_current, v_cache_current,
+            sink, window_left, causal, sm_scale
+        )
+
+        # Use flashinfer to calculate result (need format conversion to adapt to existing API)
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        )
+
+        # Set correct indptr: q_len=1 for each batch, kv_len=current_kv_len for each batch
+        qo_indptr_host = torch.arange(0, batch_size + 1, dtype=torch.int32)  # [0, 1, 2, ..., batch_size]
+        kv_indptr_host = torch.arange(
+            0, batch_size * current_kv_len + 1, current_kv_len, dtype=torch.int32
+        )
+
+        wrapper.plan(
+            qo_indptr_host,
+            kv_indptr_host,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            causal=causal,
+            window_left=window_left,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+        )
+
+        # Convert to format expected by flashinfer [total_q_len, num_heads, head_dim]
+        q_flashinfer = q_new.view(batch_size, num_qo_heads, head_dim)  # [batch_size, num_heads, head_dim]
+        k_flashinfer = k_cache_current.view(batch_size * current_kv_len, num_kv_heads, head_dim)
+        v_flashinfer = v_cache_current.view(batch_size * current_kv_len, num_kv_heads, head_dim)
+
+        o_flashinfer = wrapper.run(q_flashinfer, k_flashinfer, v_flashinfer, sink, sm_scale)
+
+        # Verify results
+        if dtype == torch.float16:
+            torch.testing.assert_close(o_flashinfer, o_ref, rtol=1e-3, atol=1e-3)
+        else:
+            torch.testing.assert_close(o_flashinfer, o_ref, rtol=1e-2, atol=1e-2)
+
+        # Also test with BatchPrefillWithPagedKVCacheWrapper
+        wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        )
+        kv_indices_host = torch.arange(
+            0,
+            batch_size * current_kv_len,
+            dtype=torch.int32,
+        )
+        paged_kv_last_page_len_host = torch.full((batch_size,), 1, dtype=torch.int32)
+        wrapper_paged.plan(
+            qo_indptr_host,
+            kv_indptr_host,
+            kv_indices_host,
+            paged_kv_last_page_len_host,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            1,
+            causal=causal,
+            window_left=window_left,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+        )
+        o_paged = wrapper_paged.run(q_flashinfer, (k_flashinfer, v_flashinfer), sink, sm_scale)
+        if dtype == torch.float16:
+            torch.testing.assert_close(o_paged, o_ref, rtol=1e-3, atol=1e-3)
+        else:
+            torch.testing.assert_close(o_paged, o_ref, rtol=1e-2, atol=1e-2)
+
+        # Accumulate new K,V for next step
+        if step == 0:
+            k_accumulated = k_new
+            v_accumulated = v_new
+        else:
+            k_accumulated = torch.cat([k_accumulated, k_new], dim=1)
+            v_accumulated = torch.cat([v_accumulated, v_new], dim=1)
+
+        print(f"Step {step}: q_len=1, kv_len={current_kv_len}, both RaggedKV and PagedKV wrappers passed!")
 
 
 if __name__ == "__main__":
