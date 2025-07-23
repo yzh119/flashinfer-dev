@@ -6,6 +6,7 @@ import torch
 
 import flashinfer
 from flashinfer.jit.utils import filename_safe_dtype_map
+from typing import Optional
 
 attention_sink_decl = r"""
 struct AttentionSink : AttentionVariantBase {
@@ -56,136 +57,266 @@ def sink_softmax(logits, sink):
     return score
 
 
-def sink_attention_ref(
-    batch_size,
+def sink_attention_unified(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     sink: torch.Tensor,
-    window_left: bool,
+    window_left: int,
     causal: bool,
     sm_scale: float,
+    batch_size: Optional[int] = None,
+    mode: str = "auto",
 ) -> torch.Tensor:
-    qo_len = q.shape[0] // batch_size
-    kv_len = k.shape[0] // batch_size
-    num_qo_heads = q.shape[1]
-    num_kv_heads = k.shape[1]
-    if num_qo_heads != num_kv_heads:
-        # repeat interleave kv
-        k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=1)
-        v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=1)
+    """
+    Unified sink attention implementation supporting prefill, incremental, and chunk prefill scenarios.
 
-    head_dim_qk = q.shape[2]
-    head_dim_vo = v.shape[2]
-    logits = (
-        torch.einsum(
-            "bmhd,bnhd->bhmn",
-            q.view(batch_size, qo_len, num_qo_heads, head_dim_qk).float(),
-            k.view(batch_size, kv_len, num_qo_heads, head_dim_qk).float(),
+    Args:
+        q: Query tensor. Format depends on mode:
+           - Regular Prefill: [total_q_len, num_qo_heads, head_dim] where q_len == kv_len
+           - Incremental: [batch_size, num_qo_heads, head_dim] where q_len == 1
+           - Chunk Prefill: [total_q_len, num_qo_heads, head_dim] where q_len != kv_len and q_len > 1
+        k: Key tensor. Format depends on mode:
+           - Regular Prefill: [total_kv_len, num_kv_heads, head_dim]
+           - Incremental: [batch_size, kv_len, num_kv_heads, head_dim]
+           - Chunk Prefill: [total_kv_len, num_kv_heads, head_dim]
+        v: Value tensor, same format as k
+        sink: Sink values [num_qo_heads]
+        window_left: Sliding window size (-1 for no window)
+        causal: Whether to apply causal masking
+        sm_scale: Scaling factor for attention
+        batch_size: Required for prefill/chunk modes, auto-detected for incremental
+        mode: Processing mode:
+            - "auto": Auto-detect based on tensor shapes and dimensions
+            - "prefill": Regular prefill (q_len == kv_len)
+            - "incremental": Incremental generation (q_len == 1)
+            - "chunk": Chunk prefill (q_len != kv_len and q_len > 1)
+
+    Returns:
+        Output tensor. Format depends on mode:
+        - Regular Prefill: [total_q_len, num_qo_heads, head_dim]
+        - Incremental: [batch_size, num_qo_heads, head_dim]
+        - Chunk Prefill: [total_q_len, num_qo_heads, head_dim]
+    """
+
+    # Auto-detect mode if not specified
+    if mode == "auto":
+        if len(q.shape) == 3 and len(k.shape) == 4:
+            # q: [batch_size, num_heads, head_dim], k: [batch_size, kv_len, num_heads, head_dim]
+            # This is incremental mode
+            mode = "incremental"
+        elif len(q.shape) == 3 and len(k.shape) == 3:
+            # Both q and k are flattened: [total_len, num_heads, head_dim]
+            if batch_size is None:
+                raise ValueError("batch_size is required for auto-detection in prefill/chunk modes")
+
+            qo_len = q.shape[0] // batch_size
+            kv_len = k.shape[0] // batch_size
+
+            if qo_len == kv_len:
+                mode = "prefill"
+            elif qo_len == 1:
+                mode = "incremental"  # Special case: single token with flattened format
+            elif qo_len > 1 and qo_len != kv_len:
+                mode = "chunk"
+            else:
+                raise ValueError(f"Cannot auto-detect mode: qo_len={qo_len}, kv_len={kv_len}")
+        else:
+            raise ValueError(f"Cannot auto-detect mode from tensor shapes: q={q.shape}, k={k.shape}")
+
+    # Process based on detected/specified mode
+    if mode == "incremental":
+        # Incremental generation mode: q_len=1, kv_len from cache
+        batch_size = q.shape[0]
+        qo_len = 1
+        kv_len = k.shape[1]
+        num_qo_heads = q.shape[1]
+        num_kv_heads = k.shape[2]
+
+        # Handle GQA
+        if num_qo_heads != num_kv_heads:
+            k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=2)
+            v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=2)
+            num_kv_heads = num_qo_heads
+
+        head_dim_qk = q.shape[2]
+        head_dim_vo = v.shape[3]
+
+        # Compute logits: [batch_size, num_heads, 1, kv_len]
+        logits = (
+            torch.einsum(
+                "bhd,blhd->bhl",
+                q.float(),
+                k.float(),
+            ).unsqueeze(2)  # Add seq_len=1 dimension
+            * sm_scale
         )
-        * sm_scale
-    )
 
-    if causal:
-        mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
-            1
-        ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
-        if window_left >= 0:
-            row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
-            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
-            mask &= row_idx - window_left <= col_idx
+    elif mode in ["prefill", "chunk"]:
+        # Prefill or Chunk prefill mode: q and k are flattened tensors
+        if batch_size is None:
+            raise ValueError(f"batch_size is required for {mode} mode")
+
+        qo_len = q.shape[0] // batch_size
+        kv_len = k.shape[0] // batch_size
+        num_qo_heads = q.shape[1]
+        num_kv_heads = k.shape[1]
+
+        # Handle GQA
+        if num_qo_heads != num_kv_heads:
+            k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=1)
+            v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=1)
+
+        head_dim_qk = q.shape[2]
+        head_dim_vo = v.shape[2]
+
+        # Compute logits: [batch_size, qo_len, num_heads, kv_len]
+        logits = (
+            torch.einsum(
+                "bmhd,bnhd->bhmn",
+                q.view(batch_size, qo_len, num_qo_heads, head_dim_qk).float(),
+                k.view(batch_size, kv_len, num_qo_heads, head_dim_qk).float(),
+            )
+            * sm_scale
+        )
+
     else:
-        mask = torch.ones(qo_len, kv_len, device=q.device)
-        if window_left >= 0:
-            row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
-            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
-            mask = row_idx - window_left <= col_idx
+        raise ValueError(f"Unknown mode: {mode}. Supported modes: 'auto', 'prefill', 'incremental', 'chunk'")
 
+    # Build attention mask (unified for all modes)
+    if causal:
+        if mode == "incremental":
+            # For incremental: new token can attend to all previous tokens
+            mask = torch.ones(1, kv_len, device=q.device, dtype=torch.bool)
+            if window_left >= 0:
+                col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)
+                mask = (kv_len - 1 - window_left) <= col_idx
+        elif mode == "prefill":
+            # For regular prefill: standard causal mask
+            mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(1) >= \
+                   torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+            if window_left >= 0:
+                row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
+                col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+                mask &= row_idx - window_left <= col_idx
+        elif mode == "chunk":
+            # For chunk prefill: each query position can attend to all previous KV positions
+            # Current chunk positions are at the end: [kv_len - qo_len : kv_len]
+            current_chunk_start = kv_len - qo_len
+            row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]  # Positions within chunk
+            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]  # All KV positions
+
+            # Each position can attend to: all historical + positions up to itself in current chunk
+            abs_row_positions = current_chunk_start + row_idx  # Absolute positions in full sequence
+            mask = abs_row_positions >= col_idx  # Standard causal mask
+
+            if window_left >= 0:
+                mask &= abs_row_positions - window_left <= col_idx
+    else:
+        # Non-causal mask
+        if mode == "incremental":
+            mask = torch.ones(1, kv_len, device=q.device, dtype=torch.bool)
+            if window_left >= 0:
+                col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)
+                mask = (kv_len - 1 - window_left) <= col_idx
+        else:  # prefill or chunk
+            mask = torch.ones(qo_len, kv_len, device=q.device, dtype=torch.bool)
+            if window_left >= 0:
+                if mode == "chunk":
+                    # For chunk mode, apply window relative to absolute positions
+                    current_chunk_start = kv_len - qo_len
+                    row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
+                    col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+                    abs_row_positions = current_chunk_start + row_idx
+                    mask = abs_row_positions - window_left <= col_idx
+                else:  # prefill
+                    row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
+                    col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+                    mask = row_idx - window_left <= col_idx
+
+    # Apply mask
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
 
+    # Apply sink softmax
     p = sink_softmax(logits, sink)
-    o_ref = (
-        torch.einsum(
-            "bhmn,bnhd->bmhd",
-            p,
-            v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
+
+    # Compute output
+    if mode == "incremental":
+        # Incremental mode output
+        o_ref = (
+            torch.einsum(
+                "bhml,blhd->bhd",
+                p,  # [batch_size, num_heads, 1, kv_len]
+                v.float(),  # [batch_size, kv_len, num_heads, head_dim]
+            )
+            .contiguous()
+            .to(q)
         )
-        .contiguous()
-        .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
-        .to(q)
-    )
+    else:  # prefill or chunk mode
+        # Prefill/Chunk mode output
+        o_ref = (
+            torch.einsum(
+                "bhmn,bnhd->bmhd",
+                p,  # [batch_size, num_heads, qo_len, kv_len]
+                v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
+            )
+            .contiguous()
+            .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
+            .to(q)
+        )
 
     return o_ref
 
 
-def sink_attention_incremental_ref(
-    q: torch.Tensor,  # [batch_size, num_qo_heads, head_dim] - single query token
-    k_cache: torch.Tensor,  # [batch_size, kv_len, num_kv_heads, head_dim] - accumulated KV cache
-    v_cache: torch.Tensor,  # [batch_size, kv_len, num_kv_heads, head_dim] - accumulated KV cache
+# Wrapper functions for backward compatibility
+def sink_attention_ref(
+    batch_size: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     sink: torch.Tensor,
     window_left: int,
     causal: bool,
     sm_scale: float,
 ) -> torch.Tensor:
-    """
-    Reference implementation for incremental generation: q_len=1, kv_len is the historical length
-    """
-    batch_size = q.shape[0]
-    qo_len = 1  # Always 1 during incremental generation
-    kv_len = k_cache.shape[1]
-    num_qo_heads = q.shape[1]
-    num_kv_heads = k_cache.shape[2]
-
-    if num_qo_heads != num_kv_heads:
-        # repeat interleave kv
-        k_cache = torch.repeat_interleave(k_cache, num_qo_heads // num_kv_heads, dim=2)
-        v_cache = torch.repeat_interleave(v_cache, num_qo_heads // num_kv_heads, dim=2)
-        num_kv_heads = num_qo_heads
-
-    head_dim_qk = q.shape[2]
-    head_dim_vo = v_cache.shape[3]
-
-    # Calculate attention logits: [batch_size, num_heads, 1, kv_len]
-    logits = (
-        torch.einsum(
-            "bhd,blhd->bhl",
-            q.float(),  # [batch_size, num_heads, head_dim]
-            k_cache.float(),  # [batch_size, kv_len, num_heads, head_dim]
-        ).unsqueeze(2)  # Add seq_len=1 dimension -> [batch_size, num_heads, 1, kv_len]
-        * sm_scale
+    """Backward compatible wrapper for prefill mode."""
+    return sink_attention_unified(
+        q, k, v, sink, window_left, causal, sm_scale,
+        batch_size=batch_size, mode="prefill"
     )
 
-    # Build mask for incremental generation scenario
-    if causal:
-        # For incremental generation, new token can attend to all previous tokens
-        mask = torch.ones(1, kv_len, device=q.device, dtype=torch.bool)
-        if window_left >= 0:
-            # Apply sliding window: can only see tokens within window_left range
-            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)
-            mask = (kv_len - 1 - window_left) <= col_idx  # Current position is kv_len-1
-    else:
-        mask = torch.ones(1, kv_len, device=q.device, dtype=torch.bool)
-        if window_left >= 0:
-            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)
-            mask = (kv_len - 1 - window_left) <= col_idx
 
-    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
-
-    # Apply sink softmax
-    p = sink_softmax(logits, sink)  # [batch_size, num_heads, 1, kv_len]
-
-    # Calculate output
-    o_ref = (
-        torch.einsum(
-            "bhml,blhd->bhd",
-            p,  # [batch_size, num_heads, 1, kv_len]
-            v_cache.float(),  # [batch_size, kv_len, num_heads, head_dim]
-        )
-        .contiguous()
-        .to(q)  # [batch_size, num_heads, head_dim]
+def sink_attention_incremental_ref(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    sink: torch.Tensor,
+    window_left: int,
+    causal: bool,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Backward compatible wrapper for incremental mode."""
+    return sink_attention_unified(
+        q, k_cache, v_cache, sink, window_left, causal, sm_scale,
+        mode="incremental"
     )
 
-    return o_ref
+
+def sink_attention_chunk_ref(
+    batch_size: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sink: torch.Tensor,
+    window_left: int,
+    causal: bool,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Wrapper for chunk prefill mode."""
+    return sink_attention_unified(
+        q, k, v, sink, window_left, causal, sm_scale,
+        batch_size=batch_size, mode="chunk"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])  # , torch.bfloat16])
@@ -267,7 +398,7 @@ def test_attention_sink(
 
     o = wrapper.run(q, k, v, sink, sm_scale)
     o_ref = sink_attention_ref(
-        batch_size, q, k, v, sink, window_left, causal=causal, sm_scale=sm_scale
+        batch_size, q, k, v, sink, window_left, causal, sm_scale
     )
     if dtype == torch.float16:
         torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
@@ -309,7 +440,7 @@ def test_attention_sink(
 @pytest.mark.parametrize("initial_seq_len", [32, 128, 512])
 @pytest.mark.parametrize("num_generation_steps", [1, 2, 4])
 @pytest.mark.parametrize("num_qo_heads", [32])
-@pytest.mark.parametrize("num_kv_heads", [8,32])
+@pytest.mark.parametrize("num_kv_heads", [8, 32])
 @pytest.mark.parametrize("window_left", [-1, 127, 128])
 @pytest.mark.parametrize("causal", [True, False])
 def test_attention_sink_incremental_generation(
@@ -459,6 +590,138 @@ def test_attention_sink_incremental_generation(
             v_accumulated = torch.cat([v_accumulated, v_new], dim=1)
 
         print(f"Step {step}: q_len=1, kv_len={current_kv_len}, both RaggedKV and PagedKV wrappers passed!")
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("chunk_size", [128, 256, 512])
+@pytest.mark.parametrize("historical_len", [256, 512, 1024])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [8, 32])
+@pytest.mark.parametrize("window_left", [-1, 127, 128])
+@pytest.mark.parametrize("causal", [True, False])
+def test_attention_sink_chunk_prefill(
+    dtype, batch_size, chunk_size, historical_len,
+    num_qo_heads, num_kv_heads, window_left, causal
+):
+    """
+    Test chunk prefill scenario: q_len != kv_len and q_len > 1
+    Simulate chunk-based processing of long sequences where current chunk
+    attends to all historical tokens plus current chunk tokens
+    """
+    # Skip invalid combinations
+    if chunk_size >= historical_len:
+        pytest.skip("chunk_size should be smaller than historical_len for meaningful chunk prefill test")
+
+    head_dim = 128
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    total_kv_len = historical_len + chunk_size
+
+    # Create JIT arguments
+    jit_args = (
+        f"chunk_prefill_attention_sink_{filename_safe_dtype_map[dtype]}",
+        dtype, dtype, dtype, torch.int32,
+        head_dim, head_dim,
+        ["sink"], ["float"],
+        ["sm_scale"], ["double"],
+        "AttentionSink",
+        attention_sink_decl,
+    )
+
+    float_workspace_buffer = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+    )
+
+    # Create input tensors for chunk prefill scenario
+    # q represents current chunk: [batch_size * chunk_size, num_heads, head_dim]
+    q_chunk = torch.randn(
+        batch_size * chunk_size, num_qo_heads, head_dim,
+        dtype=dtype, device="cuda"
+    )
+
+    # k, v represent all tokens (historical + current chunk)
+    k_all = torch.randn(
+        batch_size * total_kv_len, num_kv_heads, head_dim,
+        dtype=dtype, device="cuda"
+    )
+    v_all = torch.randn(
+        batch_size * total_kv_len, num_kv_heads, head_dim,
+        dtype=dtype, device="cuda"
+    )
+
+    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 100
+
+    # Calculate reference result using chunk prefill mode
+    o_ref = sink_attention_chunk_ref(
+        batch_size, q_chunk, k_all, v_all,
+        sink, window_left, causal, sm_scale
+    )
+
+    # Test with flashinfer
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+    )
+
+    # Set up indices for chunk prefill
+    qo_indptr_host = torch.arange(
+        0, batch_size * chunk_size + 1, chunk_size, dtype=torch.int32
+    )
+    kv_indptr_host = torch.arange(
+        0, batch_size * total_kv_len + 1, total_kv_len, dtype=torch.int32
+    )
+
+    wrapper.plan(
+        qo_indptr_host,
+        kv_indptr_host,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=causal,
+        window_left=window_left,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+
+    o_flashinfer = wrapper.run(q_chunk, k_all, v_all, sink, sm_scale)
+
+    # Verify results
+    if dtype == torch.float16:
+        torch.testing.assert_close(o_flashinfer, o_ref, rtol=1e-3, atol=1e-3)
+    else:
+        torch.testing.assert_close(o_flashinfer, o_ref, rtol=1e-2, atol=1e-2)
+
+    # Also test with BatchPrefillWithPagedKVCacheWrapper
+    wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+    )
+    kv_indices_host = torch.arange(
+        0,
+        batch_size * total_kv_len,
+        dtype=torch.int32,
+    )
+    paged_kv_last_page_len_host = torch.full((batch_size,), 1, dtype=torch.int32)
+    wrapper_paged.plan(
+        qo_indptr_host,
+        kv_indptr_host,
+        kv_indices_host,
+        paged_kv_last_page_len_host,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        1,
+        causal=causal,
+        window_left=window_left,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o_paged = wrapper_paged.run(q_chunk, (k_all, v_all), sink, sm_scale)
+    if dtype == torch.float16:
+        torch.testing.assert_close(o_paged, o_ref, rtol=1e-3, atol=1e-3)
+    else:
+        torch.testing.assert_close(o_paged, o_ref, rtol=1e-2, atol=1e-2)
+
+    print(f"Chunk prefill test passed: q_len={chunk_size}, kv_len={total_kv_len}, "
+          f"batch_size={batch_size}, causal={causal}")
 
 
 if __name__ == "__main__":
