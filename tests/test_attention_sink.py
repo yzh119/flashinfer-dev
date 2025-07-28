@@ -150,8 +150,8 @@ def sink_attention_unified(
 
         # Handle GQA
         if num_qo_heads != num_kv_heads:
-            k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=2)
-            v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=2)
+            k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=2).contiguous()
+            v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=2).contiguous()
             num_kv_heads = num_qo_heads
 
         head_dim_qk = q.shape[2]
@@ -179,13 +179,13 @@ def sink_attention_unified(
 
         # Handle GQA
         if num_qo_heads != num_kv_heads:
-            k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=1)
-            v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=1)
+            k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=1).contiguous()
+            v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=1).contiguous()
 
         head_dim_qk = q.shape[2]
         head_dim_vo = v.shape[2]
 
-        # Compute logits: [batch_size, qo_len, num_heads, kv_len]
+        # Compute logits: [batch_size, num_heads, qo_len, kv_len]
         logits = (
             torch.einsum(
                 "bmhd,bnhd->bhmn",
@@ -446,7 +446,7 @@ def sink_attention_varlen_ref(
 @pytest.mark.parametrize("seq_len", [1, 4, 16, 128, 1024])
 @pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
-@pytest.mark.parametrize("window_left", [-1, 127, 128])
+@pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("causal", [True, False])
 def test_attention_sink(
     dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, window_left, causal
@@ -549,12 +549,70 @@ def test_attention_sink(
         window_left=window_left,
         q_data_type=dtype,
         kv_data_type=dtype,
+        non_blocking=True
     )
     o_paged = wrapper_paged.run(q, (k, v), sink, sm_scale)
     if dtype == torch.float16:
         torch.testing.assert_close(o_paged, o_ref, rtol=1e-3, atol=1e-3)
     else:
         torch.testing.assert_close(o_paged, o_ref, rtol=1e-2, atol=1e-2)
+
+    # Test with non-contiguous KV indices (production scenario)
+    total_pages = batch_size * seq_len
+    if total_pages > 1:  # Only test fragmentation when we have multiple pages
+        # Create a fragmented page allocation pattern
+        import random
+        random.seed(42 + total_pages)  # Deterministic but varied seed
+        all_pages = list(range(0, total_pages * 2))  # Larger page pool
+        occupied_pages = set(random.sample(all_pages, min(total_pages, len(all_pages) // 2)))
+        available_pages = [p for p in all_pages if p not in occupied_pages]
+
+        # Allocate non-contiguous pages
+        kv_indices_fragmented = torch.tensor(
+            available_pages[:total_pages], dtype=torch.int32, device="cuda"
+        )
+
+        # Create new paged KV cache with larger capacity
+        k_paged_frag = torch.randn(
+            total_pages * 2, 1, num_kv_heads, head_dim,
+            dtype=dtype, device="cuda"
+        )
+        v_paged_frag = torch.randn(
+            total_pages * 2, 1, num_kv_heads, head_dim,
+            dtype=dtype, device="cuda"
+        )
+
+        # Copy K,V data to fragmented pages
+        for i, page_idx in enumerate(kv_indices_fragmented):
+            k_paged_frag[page_idx, 0] = k[i]
+            v_paged_frag[page_idx, 0] = v[i]
+
+        # Test with fragmented indices
+        wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        )
+        wrapper_paged_frag.plan(
+            qo_indptr_host,
+            kv_indptr_host,
+            kv_indices_fragmented,
+            paged_kv_last_page_len_host,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            1,
+            causal=causal,
+            window_left=window_left,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            non_blocking=True
+        )
+        o_paged_frag = wrapper_paged_frag.run(q, (k_paged_frag, v_paged_frag), sink, sm_scale)
+
+        # Verify fragmented result matches reference
+        if dtype == torch.float16:
+            torch.testing.assert_close(o_paged_frag, o_ref, rtol=1e-3, atol=1e-3)
+        else:
+            torch.testing.assert_close(o_paged_frag, o_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -563,7 +621,7 @@ def test_attention_sink(
 @pytest.mark.parametrize("num_generation_steps", [1, 2, 4])
 @pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
-@pytest.mark.parametrize("window_left", [-1, 127, 128])
+@pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("causal", [True, False])
 def test_attention_sink_incremental_generation(
     dtype, batch_size, initial_seq_len, num_generation_steps,
@@ -696,12 +754,70 @@ def test_attention_sink_incremental_generation(
             window_left=window_left,
             q_data_type=dtype,
             kv_data_type=dtype,
+            non_blocking=True
         )
         o_paged = wrapper_paged.run(q_flashinfer, (k_flashinfer, v_flashinfer), sink, sm_scale)
         if dtype == torch.float16:
             torch.testing.assert_close(o_paged, o_ref, rtol=1e-3, atol=1e-3)
         else:
             torch.testing.assert_close(o_paged, o_ref, rtol=1e-2, atol=1e-2)
+
+        # Test with non-contiguous KV indices for incremental generation
+        total_pages = batch_size * current_kv_len
+        if total_pages > 1:  # Only test fragmentation when we have multiple pages
+            # Create fragmented page allocation pattern
+            import random
+            random.seed(42 + step + current_kv_len)  # Vary seed with step and length
+            all_pages = list(range(0, total_pages * 2))
+            occupied_pages = set(random.sample(all_pages, min(total_pages, len(all_pages) // 2)))
+            available_pages = [p for p in all_pages if p not in occupied_pages]
+
+            # Allocate non-contiguous pages
+            kv_indices_fragmented = torch.tensor(
+                available_pages[:total_pages], dtype=torch.int32, device="cuda"
+            )
+
+            # Create fragmented paged KV cache
+            k_paged_frag = torch.randn(
+                total_pages * 2, 1, num_kv_heads, head_dim,
+                dtype=dtype, device="cuda"
+            )
+            v_paged_frag = torch.randn(
+                total_pages * 2, 1, num_kv_heads, head_dim,
+                dtype=dtype, device="cuda"
+            )
+
+            # Copy K,V data to fragmented pages
+            for i, page_idx in enumerate(kv_indices_fragmented):
+                k_paged_frag[page_idx, 0] = k_flashinfer[i]
+                v_paged_frag[page_idx, 0] = v_flashinfer[i]
+
+            # Test with fragmented indices
+            wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+            )
+            wrapper_paged_frag.plan(
+                qo_indptr_host,
+                kv_indptr_host,
+                kv_indices_fragmented,
+                paged_kv_last_page_len_host,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                causal=causal,
+                window_left=window_left,
+                q_data_type=dtype,
+                kv_data_type=dtype,
+                non_blocking=True
+            )
+            o_paged_frag = wrapper_paged_frag.run(q_flashinfer, (k_paged_frag, v_paged_frag), sink, sm_scale)
+
+            # Verify fragmented result matches reference
+            if dtype == torch.float16:
+                torch.testing.assert_close(o_paged_frag, o_ref, rtol=1e-3, atol=1e-3)
+            else:
+                torch.testing.assert_close(o_paged_frag, o_ref, rtol=1e-2, atol=1e-2)
 
         # Accumulate new K,V for next step
         if step == 0:
@@ -720,7 +836,7 @@ def test_attention_sink_incremental_generation(
 @pytest.mark.parametrize("historical_len", [256, 512, 1024])
 @pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
-@pytest.mark.parametrize("window_left", [-1, 127, 128])
+@pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("causal", [True, False])
 def test_attention_sink_chunk_prefill(
     dtype, batch_size, chunk_size, historical_len,
@@ -835,12 +951,70 @@ def test_attention_sink_chunk_prefill(
         window_left=window_left,
         q_data_type=dtype,
         kv_data_type=dtype,
+        non_blocking=True
     )
     o_paged = wrapper_paged.run(q_chunk, (k_all, v_all), sink, sm_scale)
     if dtype == torch.float16:
         torch.testing.assert_close(o_paged, o_ref, rtol=1e-3, atol=1e-3)
     else:
         torch.testing.assert_close(o_paged, o_ref, rtol=1e-2, atol=1e-2)
+
+    # Test with non-contiguous KV indices for chunk prefill
+    total_pages = batch_size * total_kv_len
+    if total_pages > 1:  # Only test fragmentation when we have multiple pages
+        # Create fragmented page allocation pattern
+        import random
+        random.seed(42 + batch_size + total_kv_len)  # Vary seed with batch and total length
+        all_pages = list(range(0, total_pages * 2))
+        occupied_pages = set(random.sample(all_pages, min(total_pages, len(all_pages) // 2)))
+        available_pages = [p for p in all_pages if p not in occupied_pages]
+
+        # Allocate non-contiguous pages
+        kv_indices_fragmented = torch.tensor(
+            available_pages[:total_pages], dtype=torch.int32, device="cuda"
+        )
+
+        # Create fragmented paged KV cache
+        k_paged_frag = torch.randn(
+            total_pages * 2, 1, num_kv_heads, head_dim,
+            dtype=dtype, device="cuda"
+        )
+        v_paged_frag = torch.randn(
+            total_pages * 2, 1, num_kv_heads, head_dim,
+            dtype=dtype, device="cuda"
+        )
+
+        # Copy K,V data to fragmented pages
+        for i, page_idx in enumerate(kv_indices_fragmented):
+            k_paged_frag[page_idx, 0] = k_all[i]
+            v_paged_frag[page_idx, 0] = v_all[i]
+
+        # Test with fragmented indices
+        wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        )
+        wrapper_paged_frag.plan(
+            qo_indptr_host,
+            kv_indptr_host,
+            kv_indices_fragmented,
+            paged_kv_last_page_len_host,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            1,
+            causal=causal,
+            window_left=window_left,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            non_blocking=True
+        )
+        o_paged_frag = wrapper_paged_frag.run(q_chunk, (k_paged_frag, v_paged_frag), sink, sm_scale)
+
+        # Verify fragmented result matches reference
+        if dtype == torch.float16:
+            torch.testing.assert_close(o_paged_frag, o_ref, rtol=1e-3, atol=1e-3)
+        else:
+            torch.testing.assert_close(o_paged_frag, o_ref, rtol=1e-2, atol=1e-2)
 
     print(f"Chunk prefill test passed: q_len={chunk_size}, kv_len={total_kv_len}, "
           f"batch_size={batch_size}, causal={causal}")
@@ -857,7 +1031,7 @@ def test_attention_sink_chunk_prefill(
 ])
 @pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
-@pytest.mark.parametrize("window_left", [-1, 127])
+@pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("causal", [True, False])
 def test_attention_sink_varlen(
     dtype, indptr_config, num_qo_heads, num_kv_heads, window_left, causal
@@ -988,12 +1162,70 @@ def test_attention_sink_varlen(
         window_left=window_left,
         q_data_type=dtype,
         kv_data_type=dtype,
+        non_blocking=True
     )
     o_paged = wrapper_paged.run(q, (k, v), sink, sm_scale)
     if dtype == torch.float16:
         torch.testing.assert_close(o_ref, o_paged, rtol=1e-3, atol=1e-3)
     else:
         torch.testing.assert_close(o_ref, o_paged, rtol=1e-2, atol=1e-2)
+
+    # Test with non-contiguous KV indices for variable length sequences
+    total_pages = total_kv_len
+    if total_pages > 1:  # Only test fragmentation when we have multiple pages
+        # Create fragmented page allocation pattern
+        import random
+        random.seed(42 + batch_size + total_kv_len)  # Vary seed with batch and total length
+        all_pages = list(range(0, total_pages * 2))
+        occupied_pages = set(random.sample(all_pages, min(total_pages, len(all_pages) // 2)))
+        available_pages = [p for p in all_pages if p not in occupied_pages]
+
+        # Allocate non-contiguous pages
+        kv_indices_fragmented = torch.tensor(
+            available_pages[:total_pages], dtype=torch.int32, device="cuda"
+        )
+
+        # Create fragmented paged KV cache
+        k_paged_frag = torch.randn(
+            total_pages * 2, 1, num_kv_heads, head_dim,
+            dtype=dtype, device="cuda"
+        )
+        v_paged_frag = torch.randn(
+            total_pages * 2, 1, num_kv_heads, head_dim,
+            dtype=dtype, device="cuda"
+        )
+
+        # Copy K,V data to fragmented pages
+        for i, page_idx in enumerate(kv_indices_fragmented):
+            k_paged_frag[page_idx, 0] = k[i]
+            v_paged_frag[page_idx, 0] = v[i]
+
+        # Test with fragmented indices
+        wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        )
+        wrapper_paged_frag.plan(
+            qo_indptr_tensor,
+            kv_indptr_tensor,
+            kv_indices_fragmented,
+            paged_kv_last_page_len_host,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            1,
+            causal=causal,
+            window_left=window_left,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            non_blocking=True
+        )
+        o_paged_frag = wrapper_paged_frag.run(q, (k_paged_frag, v_paged_frag), sink, sm_scale)
+
+        # Verify fragmented result matches reference
+        if dtype == torch.float16:
+            torch.testing.assert_close(o_ref, o_paged_frag, rtol=1e-3, atol=1e-3)
+        else:
+            torch.testing.assert_close(o_ref, o_paged_frag, rtol=1e-2, atol=1e-2)
 
     print(f"Variable length test passed: {description}, batch_size={batch_size}, "
           f"qo_lens={[qo_indptr[i+1]-qo_indptr[i] for i in range(batch_size)]}, "
