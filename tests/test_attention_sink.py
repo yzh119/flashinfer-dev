@@ -516,7 +516,7 @@ def test_attention_sink(
         device="cuda",
     )
 
-    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 100
+    sink = torch.exp(torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 3 - 0.5)
 
     o = wrapper.run(q, k, v, sink, sm_scale)
     o_ref = sink_attention_ref(
@@ -659,7 +659,7 @@ def test_attention_sink_incremental_generation(
         dtype=dtype, device="cuda"
     )
 
-    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 100
+    sink = torch.exp(torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 3 - 0.5)
 
     # Simulate incremental generation process
     for step in range(num_generation_steps):
@@ -887,7 +887,7 @@ def test_attention_sink_chunk_prefill(
         dtype=dtype, device="cuda"
     )
 
-    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 100
+    sink = torch.exp(torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 3 - 0.5)
 
     # Calculate reference result using chunk prefill mode
     o_ref = sink_attention_chunk_ref(
@@ -1078,7 +1078,7 @@ def test_attention_sink_varlen(
     qo_indptr_tensor = torch.tensor(qo_indptr, dtype=torch.int32, device="cuda")
     kv_indptr_tensor = torch.tensor(kv_indptr, dtype=torch.int32, device="cuda")
 
-    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 100
+    sink = torch.exp(torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 3 - 0.5)
 
     # Test the variable length reference implementation
     o_ref = sink_attention_varlen_ref(
