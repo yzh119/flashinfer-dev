@@ -45,18 +45,21 @@ template <uint32_t vec_size, typename DTypeIn, typename DTypeO>
 __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ s_a,
                                  DTypeIn* __restrict__ v_b, float* __restrict__ s_b,
                                  DTypeO* __restrict__ v_merged, float* __restrict__ s_merged,
-                                 uint32_t num_heads, uint32_t head_dim) {
+                                 uint32_t num_heads, uint32_t head_dim, float* __restrict__ sink) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
   uint32_t head_idx = ty;
 
   float s_a_val = s_a[pos * num_heads + head_idx];
   float s_b_val = s_b[pos * num_heads + head_idx];
+  float sink_val = math::ptx_log2(sink[head_idx]);
   float s_max = max(s_a_val, s_b_val);
+  s_max = max(s_max, sink_val);
   s_a_val = math::ptx_exp2(s_a_val - s_max);
   s_b_val = math::ptx_exp2(s_b_val - s_max);
-  float a_scale = s_a_val / (s_a_val + s_b_val);
-  float b_scale = s_b_val / (s_a_val + s_b_val);
+  sink_val = math::ptx_exp2(sink_val - s_max);
+  float a_scale = s_a_val / (s_a_val + s_b_val + sink_val);
+  float b_scale = s_b_val / (s_a_val + s_b_val + sink_val);
   vec_t<float, vec_size> v_a_vec, v_b_vec, v_merged_vec;
   v_a_vec.cast_load(v_a + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
   v_b_vec.cast_load(v_b + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
@@ -66,6 +69,7 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
   }
   v_merged_vec.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
   if (s_merged != nullptr) {
+    // why not math::ptx_log2(math::ptx_exp2(math::ptx_log2(s_a_val) + s_max) + math::ptx_exp2(math::ptx_log2(s_b_val) + s_max)))?
     s_merged[pos * num_heads + head_idx] = math::ptx_log2(s_a_val + s_b_val) + s_max;
   }
 }
@@ -87,7 +91,7 @@ template <uint32_t vec_size, typename DType>
 __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict__ s,
                                         DType* __restrict__ v_other, float* __restrict__ s_other,
                                         uint8_t* __restrict__ mask, uint32_t num_heads,
-                                        uint32_t head_dim) {
+                                        uint32_t head_dim, float* __restrict__ sink) {
   uint32_t pos = blockIdx.x;
 
   if (mask != nullptr && mask[pos] == 0) return;
@@ -97,11 +101,14 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
 
   float s_val = s[pos * num_heads + head_idx];
   float s_other_val = s_other[pos * num_heads + head_idx];
+  float sink_val = math::ptx_log2(sink[head_idx]);
   float s_max = max(s_val, s_other_val);
+  s_max = max(s_max, sink_val);
   s_val = math::ptx_exp2(s_val - s_max);
   s_other_val = math::ptx_exp2(s_other_val - s_max);
-  float scale = s_val / (s_val + s_other_val);
-  float other_scale = s_other_val / (s_val + s_other_val);
+  sink_val = math::ptx_exp2(sink_val - s_max);
+  float scale = s_val / (s_val + s_other_val + sink_val);
+  float other_scale = s_other_val / (s_val + s_other_val + sink_val);
   vec_t<float, vec_size> v_vec, v_other_vec;
   v_vec.cast_load(v + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
   v_other_vec.cast_load(v_other + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
@@ -567,6 +574,7 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
 template <typename DTypeIn, typename DTypeO>
 cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DTypeO* v_merged,
                        float* s_merged, uint32_t seq_len, uint32_t num_heads, uint32_t head_dim,
+                       float* sink,
                        cudaStream_t stream = nullptr) {
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
@@ -575,7 +583,7 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
     dim3 nblks(seq_len);
     dim3 nthrs(bdx, bdy);
     auto kernel = MergeStateKernel<vec_size, DTypeIn, DTypeO>;
-    void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &s_merged, &num_heads, &head_dim};
+    void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &s_merged, &num_heads, &head_dim, &sink};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;
@@ -598,7 +606,7 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
  */
 template <typename DType>
 cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other, uint32_t seq_len,
-                              uint32_t num_heads, uint32_t head_dim, uint8_t* mask = nullptr,
+                              uint32_t num_heads, uint32_t head_dim, float* sink, uint8_t* mask = nullptr,
                               cudaStream_t stream = nullptr) {
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DType), HEAD_DIM / 32U);
@@ -607,7 +615,7 @@ cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other
     dim3 nblks(seq_len);
     dim3 nthrs(bdx, bdy);
     auto kernel = MergeStateInPlaceKernel<vec_size, DType>;
-    void* args[] = {&v, &s, &v_other, &s_other, &mask, &num_heads, &head_dim};
+    void* args[] = {&v, &s, &v_other, &s_other, &mask, &num_heads, &head_dim, &sink};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;
