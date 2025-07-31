@@ -1460,8 +1460,8 @@ def gemm_fp8_nt_groupwise(
             workspace_buffer,
             a,
             b,
-            a_scale.t(),
-            b_scale.t().contiguous().t(),
+            a_scale,
+            b_scale,
             out,
         )
 
