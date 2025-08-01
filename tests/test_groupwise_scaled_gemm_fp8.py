@@ -149,8 +149,7 @@ def test_fp8_groupwise_gemm(
         b_fp8,
         a_scale,
         b_scale,
-        a_scale_major_mode=a_scale_major_mode,
-        b_scale_major_mode=b_scale_major_mode,
+        scale_major_modes=scale_major_modes,
         out_dtype=out_dtype,
         backend=backend,
     )

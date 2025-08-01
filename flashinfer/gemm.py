@@ -1347,8 +1347,7 @@ def gemm_fp8_nt_groupwise(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    a_scale_major_mode: Literal["MN", "K"] = "MN",
-    b_scale_major_mode: Literal["MN", "K"] = "MN",
+    scale_major_modes: Optional[Tuple[Literal["MN", "K"], Literal["MN", "K"]]] = None,
     mma_sm: int = 1,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
@@ -1377,11 +1376,9 @@ def gemm_fp8_nt_groupwise(
         Row-major scale tensor for b, shape ``(n // n_granularity, k // k_granularity)`` if b_scale_major_mode is ``K``
         or shape ``(k // k_granularity, n // n_granularity)`` if b_scale_major_mode is ``MN``
 
-    a_scale_major_mode: Literal["MN", "K"]
-        The layout mode of :attr:`a_scale` tensor, ``MN`` for MN-major scale and ``K`` for K-major scale
-
-    b_scale_major_mode: Literal["MN", "K"]
-        The layout mode of :attr:`b_scale` tensor, ``MN`` for MN-major scale and ``K`` for K-major scale
+    scale_major_modes: Optional[Tuple[Literal["MN", "K"], Literal["MN", "K"]]]
+        The tuple of layout mode of :attr:`a_scale` and :attr:`b_scale` tensor, ``MN`` for MN-major scale and ``K`` for K-major scale,
+        If not specified, will use the default layout mode of the backend (``cutlass``: ``MN`` for both, ``trtllm``: ``MN`` for :attr:`a_scale` and ``K`` for :attr:`b_scale`)
 
     mma_sm: int
         How many SMs to use for the MMA operation for "cutlass" backend, must be 1 or 2.
@@ -1424,6 +1421,15 @@ def gemm_fp8_nt_groupwise(
         raise ValueError(
             f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
         )
+
+    if scale_major_modes is None:
+        # choose backend default scale major modes
+        if backend == "trtllm":
+            scale_major_modes = ("MN", "K")
+        else:
+            scale_major_modes = ("MN", "MN")
+
+    a_scale_major_mode, b_scale_major_mode = scale_major_modes
 
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
