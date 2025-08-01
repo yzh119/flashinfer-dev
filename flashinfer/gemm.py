@@ -1347,7 +1347,8 @@ def gemm_fp8_nt_groupwise(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    scale_major_mode: Literal["MN", "K"] = "MN",
+    a_scale_major_mode: Literal["MN", "K"] = "MN",
+    b_scale_major_mode: Literal["MN", "K"] = "MN",
     mma_sm: int = 1,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
@@ -1363,38 +1364,32 @@ def gemm_fp8_nt_groupwise(
     Parameters
     ----------
     a: torch.Tensor
-        Row-major input tensor shape (m, k), fp8 e4m3 or fp8 e5m2.
+        Input a tensor with shape (m, k), fp8 e4m3 or fp8 e5m2.
 
     b: torch.Tensor
-        Column-major input tensor shape (n, k), fp8 e4m3 or fp8 e5m2.
+        Input b tensor (transposed) with shape (n, k), fp8 e4m3 or fp8 e5m2.
 
     a_scale: torch.Tensor
-        if the backend is ``cutlass``:
-            Column-major scale tensor for a, shape ``(m, k // block_size)`` if scale_major_mode is ``K``
-            or shape ``(k // block_size, m)`` if scale_major_mode is ``MN``
-        if the backend is ``trtllm``:
-            only scale_major_mode == "MN" is supported, the scale tensor should be (m, k // block_size),
-            contiguous on the first dimension
+        Column-major scale tensor for a, shape ``(m // m_granularity, k // k_granularity)`` if a_scale_major_mode is ``K``
+        or shape ``(k // k_granularity, m // m_granularity)`` if a_scale_major_mode is ``MN``
 
     b_scale: torch.Tensor
-        if the backend is ``cutlass``:
-            Row-major scale tensor for b, shape ``(n // block_size, k // block_size)`` if scale_major_k is ``K``
-            or shape ``(k // block_size, n // block_size)`` if scale_major_mode is ``MN``
-        if the backend is ``trtllm``:
-            only scale_major_mode == "MN" is supported, the scale tensor should be (k // block_size, n // block_size),
-            contiguous on the first dimension
+        Row-major scale tensor for b, shape ``(n // n_granularity, k // k_granularity)`` if b_scale_major_mode is ``K``
+        or shape ``(k // k_granularity, n // n_granularity)`` if b_scale_major_mode is ``MN``
+
+    a_scale_major_mode: Literal["MN", "K"]
+        The layout mode of :attr:`a_scale` tensor, ``MN`` for MN-major scale and ``K`` for K-major scale
+
+    b_scale_major_mode: Literal["MN", "K"]
+        The layout mode of :attr:`b_scale` tensor, ``MN`` for MN-major scale and ``K`` for K-major scale
+
+    mma_sm: int
+        How many SMs to use for the MMA operation for "cutlass" backend, must be 1 or 2.
+        2 is faster when number of rows (M) per group is large (>= 256).
+        For "trtllm" backend, this argument is ignored.
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
-
-    scale_major_mode: Literal["MN", "K"]
-        The layout mode of scale tensor, `MN` for MN-major scale with shape of
-        ``(k // block_size, *)`` and `K` for K-major scale with shape of
-        ``(*, k // block_size)``
-
-    mma_sm: int
-        How many SMs to use for the MMA operation, must be 1 or 2.
-        2 is faster when number of rows (M) per group is large (>= 256).
 
     out: Optional[torch.Tensor]
         Output tensor, shape (m, n). If not specified, we will create an output tensor explicitly.
@@ -1405,6 +1400,10 @@ def gemm_fp8_nt_groupwise(
 
     backend: Literal["cutlass", "trtllm"]
         The backend to use for the operation. Defaults to ``"cutlass"``.
+        For "cutlass" backend, :attr:`a_scale_major_mode` and :attr:`b_scale_major_mode` must be the same,
+        and :attr:`scale_granularity_mnk` must be (1, 128, 128) or (128, 128, 128).
+        For "trtllm" backend, :attr:`a_scale_major_mode` must be "MN" and :attr:`b_scale_major_mode` must be "K".
+        and :attr:`scale_granularity_mnk` must be (1, 128, 128).
 
     Returns
     -------
@@ -1448,6 +1447,9 @@ def gemm_fp8_nt_groupwise(
         )
 
     if backend == "cutlass":
+        assert (
+            a_scale_major_mode == b_scale_major_mode
+        ), "for cutlass backend, a_scale_major_mode and b_scale_major_mode must be the same"
         get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
             workspace_buffer,
             a,
@@ -1456,12 +1458,14 @@ def gemm_fp8_nt_groupwise(
             b_scale,
             out,
             *scale_granularity_mnk,
-            scale_major_mode,
+            a_scale_major_mode,
             mma_sm,
         )
     elif backend == "trtllm":
+        assert (
+            a_scale_major_mode == "MN" and b_scale_major_mode == "K"
+        ), "for trtllm backend, a_scale_major_mode must be MN and b_scale_major_mode must be K"
         assert scale_granularity_mnk == (1, 128, 128)
-        assert scale_major_mode == "MN"
         assert a.shape[1] >= 256
         # mma_sm is ignored
         get_trtllm_gemm_module().trtllm_gemm(
@@ -1481,7 +1485,8 @@ def gemm_fp8_nt_blockscaled(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    scale_major_mode: str = "MN",
+    a_scale_major_mode: Literal["MN", "K"] = "MN",
+    b_scale_major_mode: Literal["MN", "K"] = "MN",
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -1496,11 +1501,13 @@ def gemm_fp8_nt_blockscaled(
         b,
         a_scale,
         b_scale,
+        a_scale_major_mode=a_scale_major_mode,
+        b_scale_major_mode=b_scale_major_mode,
         scale_granularity_mnk=(128, 128, 128),
-        scale_major_mode=scale_major_mode,
         mma_sm=mma_sm,
         out=out,
         out_dtype=out_dtype,
+        backend="cutlass",
     )
 
 

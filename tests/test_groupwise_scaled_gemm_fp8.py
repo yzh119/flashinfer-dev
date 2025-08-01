@@ -33,13 +33,13 @@ from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+@pytest.mark.parametrize("scale_major_modes", [("MN", "MN"), ("K", "K")])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 def test_fp8_blockscale_gemm(
     m,
     n,
     k,
-    scale_major_mode,
+    scale_major_modes,
     out_dtype,
 ):
     torch.random.manual_seed(0)
@@ -48,24 +48,40 @@ def test_fp8_blockscale_gemm(
     a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
     b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
 
-    if scale_major_mode == "K":
+    a_scale_major_mode, b_scale_major_mode = scale_major_modes
+
+    if a_scale_major_mode == "K":
         a_scale_shape = (m // tile_size, k // tile_size)
-        b_scale_shape = (n // tile_size, k // tile_size)
     else:
         a_scale_shape = (k // tile_size, m // tile_size)
+
+    if b_scale_major_mode == "K":
+        b_scale_shape = (n // tile_size, k // tile_size)
+    else:
         b_scale_shape = (k // tile_size, n // tile_size)
+
     a_tile_shape = (tile_size, tile_size)
     b_tile_shape = (tile_size, tile_size)
 
-    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
-    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
+    a_fp8, a_scale = quantize_fp8(
+        a_val, a_scale_shape, a_tile_shape, a_scale_major_mode
+    )
+    b_fp8, b_scale = quantize_fp8(
+        b_val, b_scale_shape, b_tile_shape, b_scale_major_mode
+    )
 
-    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
-    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    a_dequant = dequantize_fp8(a_fp8, a_scale, a_scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, b_scale_major_mode)
     ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
 
     c = gemm_fp8_nt_blockscaled(
-        a_fp8, b_fp8, a_scale, b_scale, scale_major_mode, out_dtype=out_dtype
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        a_scale_major_mode=a_scale_major_mode,
+        b_scale_major_mode=b_scale_major_mode,
+        out_dtype=out_dtype,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
@@ -73,20 +89,27 @@ def test_fp8_blockscale_gemm(
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+@pytest.mark.parametrize("scale_major_modes", [("MN", "MN"), ("K", "K"), ("MN", "K")])
 @pytest.mark.parametrize("backend", ["cutlass", "trtllm"])
 def test_fp8_groupwise_gemm(
     m,
     n,
     k,
-    scale_major_mode,
+    scale_major_modes,
     backend,
 ):
     if backend == "trtllm":
-        if scale_major_mode != "MN":
-            pytest.skip("trtllm only supports MN scale_major_mode")
+        if scale_major_modes != ("MN", "K"):
+            pytest.skip(
+                "trtllm only supports MN a_scale_major_mode and K b_scale_major_mode"
+            )
         if k < 256:
             pytest.skip("k < 256")
+    if backend == "cutlass":
+        if scale_major_modes[0] != scale_major_modes[1]:
+            pytest.skip(
+                "cutlass only supports MN a_scale_major_mode and MN b_scale_major_mode"
+            )
 
     torch.random.manual_seed(0)
     tile_size = 128
@@ -95,32 +118,39 @@ def test_fp8_groupwise_gemm(
     a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
     b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
 
-    if scale_major_mode == "K":
+    a_scale_major_mode, b_scale_major_mode = scale_major_modes
+
+    if a_scale_major_mode == "K":
         a_scale_shape = (m, k // tile_size)
-        b_scale_shape = (n // tile_size, k // tile_size)
     else:
         a_scale_shape = (k // tile_size, m)
+
+    if b_scale_major_mode == "K":
+        b_scale_shape = (n // tile_size, k // tile_size)
+    else:
         b_scale_shape = (k // tile_size, n // tile_size)
+
     a_tile_shape = (1, tile_size)
     b_tile_shape = (tile_size, tile_size)
 
-    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
-    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
+    a_fp8, a_scale = quantize_fp8(
+        a_val, a_scale_shape, a_tile_shape, a_scale_major_mode
+    )
+    b_fp8, b_scale = quantize_fp8(
+        b_val, b_scale_shape, b_tile_shape, b_scale_major_mode
+    )
 
-    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
-    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    a_dequant = dequantize_fp8(a_fp8, a_scale, a_scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, b_scale_major_mode)
     ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
-
-    if backend == "trtllm":
-        a_scale = a_scale.t()
-        b_scale = b_scale.t().contiguous().t()
 
     c = gemm_fp8_nt_groupwise(
         a_fp8,
         b_fp8,
         a_scale,
         b_scale,
-        scale_major_mode,
+        a_scale_major_mode=a_scale_major_mode,
+        b_scale_major_mode=b_scale_major_mode,
         out_dtype=out_dtype,
         backend=backend,
     )
