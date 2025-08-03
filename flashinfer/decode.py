@@ -2005,6 +2005,7 @@ def trtllm_batch_decode_with_kv_cache(
     out_dtype: output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
     o_sf_scale: scale for nvfp4 output tensor scale factor.
     o_sf_vec_size: vector size for nvfp4 output tensor scale factor.
+    sinks: additional value per head in the denominator of the softmax.
 
     Returns:
     out: output torch.Tensor or FP4Tensor.
@@ -2163,6 +2164,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale: fused scale for mla bmm2 input.
     bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
     bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
+    sinks: additional value per head in the denominator of the softmax.
 
     Note:
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:

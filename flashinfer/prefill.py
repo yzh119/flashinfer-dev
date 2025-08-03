@@ -2979,6 +2979,7 @@ def trtllm_batch_context_with_kv_cache(
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
+    sinks: Optional[List[torch.Tensor]] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters:
@@ -3000,6 +3001,7 @@ def trtllm_batch_context_with_kv_cache(
     out_dtype: output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
     o_sf_scale: scale for nvfp4 output tensor scale factor.
     o_sf_vec_size: vector size for nvfp4 output tensor scale factor.
+    sinks: additional value per head in the denominator of the softmax.
 
     Returns:
     out: output torch.Tensor or FP4Tensor.
@@ -3076,6 +3078,7 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_q,
         cum_seq_lens_kv,
         sm_count,
+        sinks,
     )
     return (
         out
