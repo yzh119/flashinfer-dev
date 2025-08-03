@@ -41,7 +41,7 @@ struct SingleDecodeWithCustomMask : AttentionVariantBase {
     return ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
   })
 
-  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
     return output;
   })
 };
@@ -102,7 +102,7 @@ struct FlashSigmoid : AttentionVariantBase {
     return math::ptx_rcp(1.f + math::ptx_exp2(-float(logits * sigmoid_scale_log2 + sigmoid_bias_log2)));
   });
 
-  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
     return output;
   })
 };

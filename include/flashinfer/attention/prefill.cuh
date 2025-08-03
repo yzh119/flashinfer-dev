@@ -1051,16 +1051,20 @@ template <typename KTraits, typename Params>
 __device__ __forceinline__ void transform_output(
     const Params& params, typename KTraits::AttentionVariant variant,
     float (*o_frag)[KTraits::NUM_MMA_D_VO][8], typename KTraits::DTypeQKAccum (*m)[2],
-    float (*d)[2], const uint32_t batch_idx, const uint32_t qo_packed_idx_base,
+    float (*d)[2], const uint32_t batch_idx, const uint32_t kv_tile_idx, const uint32_t qo_packed_idx_base,
     const uint32_t warp_idx, const uint32_t lane_idx, uint32_t kv_head_idx,
     const uint_fastdiv group_size) {
   uint32_t q[KTraits::NUM_MMA_Q][2], r[KTraits::NUM_MMA_Q][2];
+  float scale[KTraits::NUM_MMA_Q][2];
 #pragma unroll
   for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
       group_size.divmod(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j, q[mma_q][j],
                         r[mma_q][j]);
+      uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][j];
+      // Update the m and d when attention sinks are used.
+      variant.update_m_d(params, kv_tile_idx, qo_head_idx, m[mma_q][j], d[mma_q][j], scale[mma_q][j]);
     }
   }
 
@@ -1074,7 +1078,7 @@ __device__ __forceinline__ void transform_output(
         const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
         o_frag[mma_q][mma_d][reg_id] = variant.OutputTransform(
             params, o_frag[mma_q][mma_d][reg_id], batch_idx, qo_idx, qo_head_idx,
-            m[mma_q][(reg_id % 4) / 2], d[mma_q][(reg_id % 4) / 2]);
+            m[mma_q][(reg_id % 4) / 2], d[mma_q][(reg_id % 4) / 2], scale[mma_q][(reg_id % 4) / 2]);
       }
     }
   }
@@ -1534,7 +1538,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
     // transform output
     transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/0,
-                                      qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
+                                      chunk_idx, qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
                                       group_size);
 
     // write back
@@ -1974,7 +1978,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
     // transform output
     transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
-                                      qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
+                                      kv_tile_idx, qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
                                       group_size);
 
     // write back
@@ -2367,7 +2371,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     // transform output
     transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
-                                      qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
+                                      kv_tile_idx, qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx,
                                       group_size);
 
     // write_back

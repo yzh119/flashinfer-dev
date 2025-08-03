@@ -524,8 +524,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   }
 
   // step 2: determine cta_tile_q, kv_chunk_size and total_num_tiles_q
-  // NOTE(Zihao): disable KV-split at this moment by setting min_kv_chunk_size to a large value
-  const uint32_t min_kv_chunk_size = std::max((1048576 / page_size), 1U);
+  const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
   uint32_t cta_tile_q;
   uint32_t total_num_tiles_q;
   if (enable_cuda_graph) {

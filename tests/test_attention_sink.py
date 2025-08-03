@@ -29,13 +29,19 @@ struct AttentionSink : AttentionVariantBase {
     return (kv_idx + qo_len + window_left >= kv_len + qo_idx);
   })
 
-  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, {
-    float log_sink = math::ptx_log2(params.sink[qo_head_idx]);
-    float m_all = (log_sink > m) ? log_sink : m;
-    float scale = math::ptx_exp2(m - m_all);
-    float d_all = d * scale;
-    float denom = math::ptx_exp2(log_sink - m_all) + d_all;
-    return (output * scale) * math::ptx_rcp(denom);
+  REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, {
+    float log_sink = (kv_tile_idx == 0 && qo_head_idx < params.num_qo_heads) ? params.sink[qo_head_idx] * math::log2e : -math::inf;
+    float m_new = (log_sink > m) ? log_sink : m;
+    scale = math::ptx_exp2(m - m_new);
+    float d_new = math::ptx_exp2(log_sink - m_new) + d * scale;
+    // Update m and d
+    m = m_new;
+    d = d_new;
+  })
+
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
+    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
+    return output * scale * d_rcp;
   });
 };
 """
@@ -44,7 +50,7 @@ struct AttentionSink : AttentionVariantBase {
 def sink_softmax(logits, sink):
     sink = einops.repeat(sink, "h -> b h m 1", b=logits.shape[0], m=logits.shape[2])
     # (b, h, m, (n + 1))
-    logits = torch.cat([logits, torch.log(sink)], dim=-1)
+    logits = torch.cat([logits, sink], dim=-1)
     # (s_1, s_2, ..., s_n)
     # (s_1, s_2, ..., s_n, log(sink))
     # (exp(s_1), exp(s_2), ..., exp(s_n), sink)
@@ -467,6 +473,7 @@ def test_attention_sink(
         attention_sink_decl,
     )
     sm_scale = 1.0 / math.sqrt(128)
+    torch.manual_seed(42)
     float_workspace_buffer = torch.empty(
         128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
     )
@@ -516,7 +523,7 @@ def test_attention_sink(
         device="cuda",
     )
 
-    sink = torch.exp(torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 3 - 0.5)
+    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 5
 
     o = wrapper.run(q, k, v, sink, sm_scale)
     o_ref = sink_attention_ref(
@@ -634,6 +641,8 @@ def test_attention_sink_incremental_generation(
     head_dim = 128
     sm_scale = 1.0 / math.sqrt(head_dim)
 
+    torch.manual_seed(42)
+
     # Create JIT arguments
     jit_args = (
         f"single_prefill_attention_sink_{filename_safe_dtype_map[dtype]}",
@@ -659,7 +668,7 @@ def test_attention_sink_incremental_generation(
         dtype=dtype, device="cuda"
     )
 
-    sink = torch.exp(torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 3 - 0.5)
+    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 5
 
     # Simulate incremental generation process
     for step in range(num_generation_steps):
@@ -853,6 +862,7 @@ def test_attention_sink_chunk_prefill(
 
     head_dim = 128
     sm_scale = 1.0 / math.sqrt(head_dim)
+    torch.manual_seed(42)
     total_kv_len = historical_len + chunk_size
 
     # Create JIT arguments
@@ -887,7 +897,7 @@ def test_attention_sink_chunk_prefill(
         dtype=dtype, device="cuda"
     )
 
-    sink = torch.exp(torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 3 - 0.5)
+    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 5
 
     # Calculate reference result using chunk prefill mode
     o_ref = sink_attention_chunk_ref(
@@ -1052,6 +1062,7 @@ def test_attention_sink_varlen(
     total_kv_len = kv_indptr[-1]
     head_dim = 128
     sm_scale = 1.0 / math.sqrt(head_dim)
+    torch.manual_seed(42)
 
     # Check if any request has qo_len > kv_len for causal case
     if causal:
@@ -1078,7 +1089,7 @@ def test_attention_sink_varlen(
     qo_indptr_tensor = torch.tensor(qo_indptr, dtype=torch.int32, device="cuda")
     kv_indptr_tensor = torch.tensor(kv_indptr, dtype=torch.int32, device="cuda")
 
-    sink = torch.exp(torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 3 - 0.5)
+    sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 5
 
     # Test the variable length reference implementation
     o_ref = sink_attention_varlen_ref(
