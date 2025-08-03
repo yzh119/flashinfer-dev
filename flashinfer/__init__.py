@@ -57,6 +57,7 @@ from .fp4_quantization import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
+from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
     RoutingMethodType,
     cutlass_fused_moe,

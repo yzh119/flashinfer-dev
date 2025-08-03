@@ -110,6 +110,7 @@ def get_trtllm_gen_prefill_module():
         cum_seq_lens_kv: torch.Tensor,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -134,6 +135,7 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_q,
             cum_seq_lens_kv,
             sm_count,
+            sinks,
         )
         return out
 
@@ -453,6 +455,7 @@ def get_batch_prefill_module(backend, *args):
         batch_size: Optional[int] = None,
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -481,6 +484,7 @@ def get_batch_prefill_module(backend, *args):
                 cum_seq_lens_kv,
                 window_left,
                 out=o,
+                sinks=sinks,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -1825,6 +1829,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -1999,6 +2004,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._batch_size,
                 self._qo_indptr_buf,
                 self._vector_sparse_indptr_buffer,
+                sinks,
             ]
 
         self._cached_module.paged_run(*run_args)
