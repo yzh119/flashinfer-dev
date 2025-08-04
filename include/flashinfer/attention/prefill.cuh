@@ -1031,9 +1031,25 @@ __device__ __forceinline__ void compute_sfm_v(
   *v_smem_offset_r -= 16 * KTraits::NUM_MMA_KV * UPCAST_STRIDE_V;
 }
 
-template <typename KTraits>
-__device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_VO][8],
-                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2]) {
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void normalize_d(
+    const Params& params, typename KTraits::AttentionVariant variant,
+    float (*o_frag)[KTraits::NUM_MMA_D_VO][8], typename KTraits::DTypeQKAccum (*m)[2],
+    float (*d)[2], const uint32_t batch_idx, const uint32_t qo_packed_idx_base,
+    const uint32_t warp_idx, const uint32_t lane_idx, const uint32_t kv_head_idx,
+    const uint_fastdiv group_size) {
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      uint32_t q, r;
+      group_size.divmod(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j, q, r);
+      const uint32_t qo_idx = q;
+      const uint32_t qo_head_idx = kv_head_idx * group_size + r;
+      variant.MDTransform(params, m[mma_q][j], d[mma_q][j], qo_idx, qo_head_idx);
+    }
+  }
+
   using AttentionVariant = typename KTraits::AttentionVariant;
   if constexpr (AttentionVariant::use_softmax) {
     float d_rcp[KTraits::NUM_MMA_Q][2];
@@ -1531,7 +1547,8 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
     // normalize d
-    normalize_d<KTraits>(o_frag, m, d);
+    normalize_d<KTraits>(params, variant, o_frag, m, d, /*batch_idx=*/0, qo_packed_idx_base,
+                         warp_idx, lane_idx, kv_head_idx, group_size);
 
     // write back
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
@@ -1967,7 +1984,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
     // normalize d
-    normalize_d<KTraits>(o_frag, m, d);
+    normalize_d<KTraits>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
+                         qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx, group_size);
 
     const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
 
@@ -2358,7 +2376,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
     // normalize d
-    normalize_d<KTraits>(o_frag, m, d);
+    normalize_d<KTraits>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
+                         qo_packed_idx_base, warp_idx, lane_idx, kv_head_idx, group_size);
 
     const uint32_t num_kv_chunks = (kv_len_safe + kv_chunk_size - 1) / kv_chunk_size;
 

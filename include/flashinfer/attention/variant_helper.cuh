@@ -43,6 +43,13 @@ namespace flashinfer {
     __VA_ARGS__                                                                                    \
   }
 
+#define REGISTER_MD_TRANSFORM(params, m, d, qo_idx, qo_head_idx, ...)                  \
+  template <typename Params, typename T_M>                                             \
+  __device__ __forceinline__ void MDTransform(const Params& params, T_M& m, float& d,  \
+                                              uint32_t qo_idx, uint32_t qo_head_idx) { \
+    __VA_ARGS__                                                                        \
+  }
+
 #define REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, ...) \
   template <typename Params>                                                                   \
   __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,         \
@@ -55,6 +62,8 @@ struct AttentionVariantBase {
   constexpr static bool use_softmax = true;
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
                             { return logits; })
+
+  REGISTER_MD_TRANSFORM(params, m, d, qo_idx, qo_head_idx, {})
 
   REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
                        { return true; })
