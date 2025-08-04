@@ -45,7 +45,7 @@ def get_cascade_module():
 
 @register_custom_op("flashinfer::merge_state", mutates_args=())
 def merge_state(
-    v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor, sink: torch.Tensor
+    v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Merge the attention output ``V`` and the logsumexp value ``S`` from the two
     KV-segments.
@@ -97,7 +97,7 @@ def merge_state(
     s_b = s_b.to(torch.float32)
     v_merged = torch.empty_like(v_a)
     s_merged = torch.empty_like(s_a)
-    get_cascade_module().merge_state(v_a, s_a, v_b, s_b, v_merged, s_merged, sink)
+    get_cascade_module().merge_state(v_a, s_a, v_b, s_b, v_merged, s_merged)
     return v_merged, s_merged
 
 
@@ -116,7 +116,6 @@ def merge_state_in_place(
     s: torch.Tensor,
     v_other: torch.Tensor,
     s_other: torch.Tensor,
-    sink: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Merge the self-attention state ``(v, s)`` with another state
@@ -157,7 +156,7 @@ def merge_state_in_place(
     """
     s = s.to(torch.float32)
     s_other = s_other.to(torch.float32)
-    get_cascade_module().merge_state_in_place(v, s, v_other, s_other, mask, sink)
+    get_cascade_module().merge_state_in_place(v, s, v_other, s_other, mask)
 
 
 @register_fake_op("flashinfer::merge_state_in_place")

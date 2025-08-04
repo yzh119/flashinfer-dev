@@ -20,7 +20,7 @@
 using namespace flashinfer;
 
 void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
-                 at::Tensor v_merged, at::Tensor s_merged, at::Tensor sink) {
+                 at::Tensor v_merged, at::Tensor s_merged) {
   CHECK_INPUT(v_a);
   CHECK_INPUT(s_a);
   CHECK_INPUT(v_b);
@@ -49,7 +49,7 @@ void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
         MergeState(static_cast<c_type*>(v_a.data_ptr()), static_cast<float*>(s_a.data_ptr()),
                    static_cast<c_type*>(v_b.data_ptr()), static_cast<float*>(s_b.data_ptr()),
                    static_cast<c_type*>(v_merged.data_ptr()),
-                   static_cast<float*>(s_merged.data_ptr()), seq_len, num_heads, head_dim, sink, stream);
+                   static_cast<float*>(s_merged.data_ptr()), seq_len, num_heads, head_dim, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "MergeState kernel launch failed: ", cudaGetErrorString(status));
     return true;
@@ -59,7 +59,7 @@ void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
 }
 
 void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Tensor s_other,
-                          std::optional<at::Tensor> mask, at::Tensor sink) {
+                          std::optional<at::Tensor> mask) {
   CHECK_INPUT(v);
   CHECK_INPUT(s);
   CHECK_INPUT(v_other);
@@ -93,7 +93,7 @@ void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Te
     cudaError_t status = MergeStateInPlace(
         static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
         static_cast<c_type*>(v_other.data_ptr()), static_cast<float*>(s_other.data_ptr()), seq_len,
-        num_heads, head_dim, sink, mask_ptr, stream);
+        num_heads, head_dim, mask_ptr, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "MergeStateInPlace kernel launch failed: ", cudaGetErrorString(status));
     return true;

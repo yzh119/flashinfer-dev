@@ -16,10 +16,10 @@
 #include "pytorch_extension_utils.h"
 
 void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
-                 at::Tensor v_merged, at::Tensor s_merged, at::Tensor sink);
+                 at::Tensor v_merged, at::Tensor s_merged);
 
 void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Tensor s_other,
-                          std::optional<at::Tensor> mask, at::Tensor sink);
+                          std::optional<at::Tensor> mask);
 
 void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged);
 
