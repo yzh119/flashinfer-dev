@@ -1172,7 +1172,7 @@ def test_attention_sink_chunk_prefill(
 
     # Create JIT arguments
     jit_args = (
-        f"chunk_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",
+        f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",
         dtype,
         dtype,
         dtype,
@@ -1454,7 +1454,7 @@ def test_attention_sink_varlen(
     # Test against FlashInfer kernel for verification
     # Create JIT arguments for attention sink
     jit_args = (
-        f"varlen_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",  # uri
+        f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",  # uri
         dtype,  # dtype_q
         dtype,  # dtype_kv
         dtype,  # dtype_o
