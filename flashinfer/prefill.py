@@ -18,7 +18,7 @@ import functools
 import logging
 import math
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -1236,6 +1236,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        jit_kwargs: Dict[str, Any] = {},
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1295,13 +1296,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        jit_kwargs : Dict[str, Any]
+            The keyword arguments to create the JIT module, defaults to an empty dictionary.
         """
         _check_kv_layout(kv_layout)
 
         if jit_args is not None:
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
+                gen_customize_batch_prefill_module(
+                    backend, *jit_args, **jit_kwargs
+                ).build_and_load(),
             )
         else:
             self._jit_module = None
@@ -2160,6 +2166,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        jit_kwargs: Dict[str, Any] = {},
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -2208,12 +2215,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        jit_kwargs : Dict[str, Any]
+            The keyword arguments to create the JIT module, defaults to an empty dictionary.
         """
         _check_kv_layout(kv_layout)
         if jit_args is not None:
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
+                gen_customize_batch_prefill_module(
+                    backend, *jit_args, **jit_kwargs
+                ).build_and_load(),
             )
         else:
             self._jit_module = None

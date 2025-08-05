@@ -656,7 +656,7 @@ def test_attention_sink(
     if backend == "fa3" and not is_sm90a_supported(device):
         pytest.skip("FA3 is not supported on this device")
     jit_args = (
-        f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_{backend}",  # uri
+        f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",  # uri
         dtype,  # dtype_q
         dtype,  # dtype_kv
         dtype,  # dtype_o
@@ -670,13 +670,20 @@ def test_attention_sink(
         "AttentionSink",
         attention_sink_decl[backend],
     )
+    jit_kwargs = {
+        "use_sliding_window": window_left >= 0,
+    }
     sm_scale = 1.0 / math.sqrt(128)
     torch.manual_seed(42)
     float_workspace_buffer = torch.empty(
         128 * 1024 * 1024, dtype=torch.uint8, device=device
     )
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+        float_workspace_buffer,
+        kv_layout="NHD",
+        backend=backend,
+        jit_args=jit_args,
+        jit_kwargs=jit_kwargs,
     )
     qo_indptr_host = torch.arange(
         0, batch_size * seq_len + 1, seq_len, dtype=torch.int32
@@ -731,7 +738,11 @@ def test_attention_sink(
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+        float_workspace_buffer,
+        kv_layout="NHD",
+        backend=backend,
+        jit_args=jit_args,
+        jit_kwargs=jit_kwargs,
     )
     kv_indices_host = torch.arange(
         0,
@@ -793,7 +804,11 @@ def test_attention_sink(
 
         # Test with fragmented indices
         wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+            float_workspace_buffer,
+            kv_layout="NHD",
+            backend=backend,
+            jit_args=jit_args,
+            jit_kwargs=jit_kwargs,
         )
         wrapper_paged_frag.plan(
             qo_indptr_host,
@@ -856,7 +871,7 @@ def test_attention_sink_incremental_generation(
 
     # Create JIT arguments
     jit_args = (
-        f"single_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_{backend}",
+        f"single_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",
         dtype,
         dtype,
         dtype,
@@ -870,6 +885,9 @@ def test_attention_sink_incremental_generation(
         "AttentionSink",
         attention_sink_decl[backend],
     )
+    jit_kwargs = {
+        "use_sliding_window": window_left >= 0,
+    }
 
     float_workspace_buffer = torch.empty(
         128 * 1024 * 1024, dtype=torch.uint8, device=device
@@ -917,7 +935,11 @@ def test_attention_sink_incremental_generation(
 
         # Use flashinfer to calculate result (need format conversion to adapt to existing API)
         wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+            float_workspace_buffer,
+            kv_layout="NHD",
+            backend=backend,
+            jit_args=jit_args,
+            jit_kwargs=jit_kwargs,
         )
 
         # Set correct indptr: q_len=1 for each batch, kv_len=current_kv_len for each batch
@@ -961,7 +983,11 @@ def test_attention_sink_incremental_generation(
 
         # Also test with BatchPrefillWithPagedKVCacheWrapper
         wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+            float_workspace_buffer,
+            kv_layout="NHD",
+            backend=backend,
+            jit_args=jit_args,
+            jit_kwargs=jit_kwargs,
         )
         kv_indices_host = torch.arange(
             0,
@@ -1029,6 +1055,7 @@ def test_attention_sink_incremental_generation(
                 kv_layout="NHD",
                 backend=backend,
                 jit_args=jit_args,
+                jit_kwargs=jit_kwargs,
             )
             wrapper_paged_frag.plan(
                 qo_indptr_host,
@@ -1110,7 +1137,7 @@ def test_attention_sink_chunk_prefill(
 
     # Create JIT arguments
     jit_args = (
-        f"chunk_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_{backend}",
+        f"chunk_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",
         dtype,
         dtype,
         dtype,
@@ -1124,6 +1151,9 @@ def test_attention_sink_chunk_prefill(
         "AttentionSink",
         attention_sink_decl[backend],
     )
+    jit_kwargs = {
+        "use_sliding_window": window_left >= 0,
+    }
 
     float_workspace_buffer = torch.empty(
         128 * 1024 * 1024, dtype=torch.uint8, device=device
@@ -1152,7 +1182,11 @@ def test_attention_sink_chunk_prefill(
 
     # Test with flashinfer
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+        float_workspace_buffer,
+        kv_layout="NHD",
+        backend=backend,
+        jit_args=jit_args,
+        jit_kwargs=jit_kwargs,
     )
 
     # Set up indices for chunk prefill
@@ -1185,7 +1219,11 @@ def test_attention_sink_chunk_prefill(
 
     # Also test with BatchPrefillWithPagedKVCacheWrapper
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+        float_workspace_buffer,
+        kv_layout="NHD",
+        backend=backend,
+        jit_args=jit_args,
+        jit_kwargs=jit_kwargs,
     )
     kv_indices_host = torch.arange(
         0,
@@ -1249,7 +1287,11 @@ def test_attention_sink_chunk_prefill(
 
         # Test with fragmented indices
         wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+            float_workspace_buffer,
+            kv_layout="NHD",
+            backend=backend,
+            jit_args=jit_args,
+            jit_kwargs=jit_kwargs,
         )
         wrapper_paged_frag.plan(
             qo_indptr_host,
@@ -1377,7 +1419,7 @@ def test_attention_sink_varlen(
     # Test against FlashInfer kernel for verification
     # Create JIT arguments for attention sink
     jit_args = (
-        f"varlen_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_{backend}",  # uri
+        f"varlen_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",  # uri
         dtype,  # dtype_q
         dtype,  # dtype_kv
         dtype,  # dtype_o
@@ -1391,6 +1433,9 @@ def test_attention_sink_varlen(
         "AttentionSink",
         attention_sink_decl[backend],
     )
+    jit_kwargs = {
+        "use_sliding_window": window_left >= 0,
+    }
 
     # Create workspace buffer
     float_workspace_buffer = torch.empty(
@@ -1399,7 +1444,11 @@ def test_attention_sink_varlen(
 
     # Test with BatchPrefillWithRaggedKVCacheWrapper
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+        float_workspace_buffer,
+        kv_layout="NHD",
+        backend=backend,
+        jit_args=jit_args,
+        jit_kwargs=jit_kwargs,
     )
 
     wrapper.plan(
@@ -1424,7 +1473,11 @@ def test_attention_sink_varlen(
 
     # Also test with BatchPrefillWithPagedKVCacheWrapper
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
+        float_workspace_buffer,
+        kv_layout="NHD",
+        backend=backend,
+        jit_args=jit_args,
+        jit_kwargs=jit_kwargs,
     )
     kv_indices_host = torch.arange(0, total_kv_len, dtype=torch.int32, device=device)
     paged_kv_last_page_len_host = torch.full(
