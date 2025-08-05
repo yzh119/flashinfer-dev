@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import einops
 import pytest
@@ -6,9 +7,9 @@ import torch
 
 import flashinfer
 from flashinfer.jit.utils import filename_safe_dtype_map
-from typing import Optional
+from flashinfer.utils import is_sm90a_supported
 
-attention_sink_decl = r"""
+attention_sink_fa2_decl = r"""
 struct AttentionSink : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
@@ -43,6 +44,116 @@ struct AttentionSink : AttentionVariantBase {
     float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
     return output * scale * d_rcp;
   });
+};
+"""
+
+attention_sink_fa3_decl = r"""
+
+template <int NUM_ROWS_PER_THREAD>
+struct OnlineSoftmaxWithSink {
+  constexpr static float fill_value = -math::inf;
+  using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>{}));
+  TensorT row_max, row_sum, scores_scale;
+  float sm_scale_log2;
+  float log_sink;
+
+  CUTLASS_DEVICE OnlineSoftmaxWithSink(float sm_scale_log2, float log_sink) : sm_scale_log2(sm_scale_log2), log_sink(log_sink) {
+    clear(scores_scale);
+  };
+
+  __forceinline__ __device__ TensorT get_lse() const { return row_sum; }
+
+  template <bool init, typename Tensor0>
+  __forceinline__ __device__ void update(Tensor0& acc_s) {
+    // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+    Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
+
+    static_assert(decltype(size<0>(scores))::value == NUM_ROWS_PER_THREAD);
+    if constexpr (init) {
+      reduce_max</*init=*/true>(scores, row_max);
+      scale_apply_exp2(scores, row_max, sm_scale_log2);
+      reduce_sum</*init=*/true, /*warp_reduce=*/false>(scores, row_sum);
+    } else {
+      // update row_max
+      Tensor scores_max_prev = make_fragment_like(row_max);
+      cute::copy(row_max, scores_max_prev);
+      reduce_max</*init=*/false>(scores, row_max);
+      // update scores_scale and scale row_sum
+#pragma unroll
+      for (int mi = 0; mi < size(row_max); ++mi) {
+        float scores_max_cur = row_max(mi);
+        scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * sm_scale_log2);
+        row_sum(mi) *= scores_scale(mi);
+      }
+      // perform exp2 on scores
+    scale_apply_exp2(scores, row_max, sm_scale_log2);
+      // update row_sum
+      reduce_sum</*init=*/false, /*warp_reduce=*/false>(scores, row_sum);
+    }
+  };
+
+  template <typename Tensor0>
+  __forceinline__ __device__ void finalize(Tensor0& acc_s, float pv_scale = 1.f) {
+    // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+    // Note (Yilong): use pv_scale to dequantize the output
+    Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
+    static_assert(decltype(size<0>(scores))::value == NUM_ROWS_PER_THREAD);
+    SumOp<float> sum_op;
+    quad_allreduce_(row_sum, row_sum, sum_op);
+
+#pragma unroll
+    for (int mi = 0; mi < size(row_max); ++mi) {
+      float m = row_max(mi);
+      float d = row_sum(mi);
+
+      float m_new = (log_sink > m) ? log_sink : m;
+      scale = math::ptx_exp2(m - m_new);
+      float d_new = math::ptx_exp2(log_sink - m_new) + d * scale;
+
+      // Update m and d
+      row_max(mi) = m_new;
+      row_sum(mi) = d_new;
+
+      scores_scale(mi) = pv_scale * scale / d_new;
+      row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(d_new);
+    }
+  };
+
+  template <typename Tensor1>
+  __forceinline__ __device__ void rescale_o(Tensor1& acc_o) {
+    // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+    Tensor acc_o_rowcol = make_tensor(acc_o.data(), convert_layout_acc_rowcol(acc_o.layout()));
+    static_assert(decltype(size<0>(acc_o_rowcol))::value == NUM_ROWS_PER_THREAD);
+#pragma unroll
+    for (int mi = 0; mi < size(row_max); ++mi) {
+#pragma unroll
+      for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+        acc_o_rowcol(mi, ni) *= scores_scale(mi);
+      }
+    }
+  };
+};
+
+struct AttentionSink : AttentionVariantBase {
+  float sm_scale_log2;
+  int qo_len, kv_len;
+
+  // Init
+  template <typename MainloopParams, typename BlockCoord>
+  __device__ __host__ AttentionSink(const MainloopParams& params, const BlockCoord& block_coord) {
+    sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
+    auto [_, __, ___, ____, _____, qo_len_, kv_len_, batch_idx] =
+        block_coord;
+
+    qo_len = qo_len_;
+    kv_len = kv_len_;
+  }
+
+
+  template <int NUM_ROWS_PER_THREAD>
+  __device__ auto GetAttentionUpdater() {
+    return OnlineSoftmaxWithSink<NUM_ROWS_PER_THREAD>(sm_scale_log2, log_sink);
+  }
 };
 """
 
@@ -129,7 +240,9 @@ def sink_attention_unified(
         elif len(q.shape) == 3 and len(k.shape) == 3:
             # Both q and k are flattened: [total_len, num_heads, head_dim]
             if batch_size is None:
-                raise ValueError("batch_size is required for auto-detection in prefill/chunk modes")
+                raise ValueError(
+                    "batch_size is required for auto-detection in prefill/chunk modes"
+                )
 
             qo_len = q.shape[0] // batch_size
             kv_len = k.shape[0] // batch_size
@@ -141,9 +254,13 @@ def sink_attention_unified(
             elif qo_len > 1 and qo_len != kv_len:
                 mode = "chunk"
             else:
-                raise ValueError(f"Cannot auto-detect mode: qo_len={qo_len}, kv_len={kv_len}")
+                raise ValueError(
+                    f"Cannot auto-detect mode: qo_len={qo_len}, kv_len={kv_len}"
+                )
         else:
-            raise ValueError(f"Cannot auto-detect mode from tensor shapes: q={q.shape}, k={k.shape}")
+            raise ValueError(
+                f"Cannot auto-detect mode from tensor shapes: q={q.shape}, k={k.shape}"
+            )
 
     # Process based on detected/specified mode
     if mode == "incremental":
@@ -156,8 +273,12 @@ def sink_attention_unified(
 
         # Handle GQA
         if num_qo_heads != num_kv_heads:
-            k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=2).contiguous()
-            v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=2).contiguous()
+            k = torch.repeat_interleave(
+                k, num_qo_heads // num_kv_heads, dim=2
+            ).contiguous()
+            v = torch.repeat_interleave(
+                v, num_qo_heads // num_kv_heads, dim=2
+            ).contiguous()
             num_kv_heads = num_qo_heads
 
         head_dim_qk = q.shape[2]
@@ -169,7 +290,9 @@ def sink_attention_unified(
                 "bhd,blhd->bhl",
                 q.float(),
                 k.float(),
-            ).unsqueeze(2)  # Add seq_len=1 dimension
+            ).unsqueeze(
+                2
+            )  # Add seq_len=1 dimension
             * sm_scale
         )
 
@@ -185,8 +308,12 @@ def sink_attention_unified(
 
         # Handle GQA
         if num_qo_heads != num_kv_heads:
-            k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=1).contiguous()
-            v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=1).contiguous()
+            k = torch.repeat_interleave(
+                k, num_qo_heads // num_kv_heads, dim=1
+            ).contiguous()
+            v = torch.repeat_interleave(
+                v, num_qo_heads // num_kv_heads, dim=1
+            ).contiguous()
 
         head_dim_qk = q.shape[2]
         head_dim_vo = v.shape[2]
@@ -214,8 +341,12 @@ def sink_attention_unified(
 
         # Handle GQA
         if num_qo_heads != num_kv_heads:
-            k = torch.repeat_interleave(k, num_qo_heads // num_kv_heads, dim=1).contiguous()
-            v = torch.repeat_interleave(v, num_qo_heads // num_kv_heads, dim=1).contiguous()
+            k = torch.repeat_interleave(
+                k, num_qo_heads // num_kv_heads, dim=1
+            ).contiguous()
+            v = torch.repeat_interleave(
+                v, num_qo_heads // num_kv_heads, dim=1
+            ).contiguous()
             num_kv_heads = num_qo_heads
 
         # Process each request in the batch separately
@@ -239,15 +370,21 @@ def sink_attention_unified(
                     "qhd,khd->hqk",
                     q_i.float(),
                     k_i.float(),
-                ).unsqueeze(0)  # Add batch dimension
+                ).unsqueeze(
+                    0
+                )  # Add batch dimension
                 * sm_scale
             )
 
             # Build attention mask for current request
             if causal:
                 # Create causal mask for this specific request
-                row_idx = torch.arange(qo_len_i, dtype=torch.int32, device=q.device)[:, None]
-                col_idx = torch.arange(kv_len_i, dtype=torch.int32, device=q.device)[None, :]
+                row_idx = torch.arange(qo_len_i, dtype=torch.int32, device=q.device)[
+                    :, None
+                ]
+                col_idx = torch.arange(kv_len_i, dtype=torch.int32, device=q.device)[
+                    None, :
+                ]
 
                 # Default causal mask: position i can attend to positions 0 to i in the kv sequence
                 # Assuming queries correspond to the last qo_len_i positions in the kv sequence
@@ -258,15 +395,23 @@ def sink_attention_unified(
                     mask_i &= query_positions - window_left <= col_idx
             else:
                 # Non-causal mask
-                mask_i = torch.ones(qo_len_i, kv_len_i, device=q.device, dtype=torch.bool)
+                mask_i = torch.ones(
+                    qo_len_i, kv_len_i, device=q.device, dtype=torch.bool
+                )
                 if window_left >= 0:
-                    row_idx = torch.arange(qo_len_i, dtype=torch.int32, device=q.device)[:, None]
-                    col_idx = torch.arange(kv_len_i, dtype=torch.int32, device=q.device)[None, :]
+                    row_idx = torch.arange(
+                        qo_len_i, dtype=torch.int32, device=q.device
+                    )[:, None]
+                    col_idx = torch.arange(
+                        kv_len_i, dtype=torch.int32, device=q.device
+                    )[None, :]
                     query_positions = kv_len_i - qo_len_i + row_idx
                     mask_i = query_positions - window_left <= col_idx
 
             # Apply mask
-            logits_i = logits_i.masked_fill(mask_i.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+            logits_i = logits_i.masked_fill(
+                mask_i.unsqueeze(0).unsqueeze(0) == 0, float("-inf")
+            )
 
             # Apply sink softmax
             p_i = sink_softmax(logits_i, sink)  # [1, num_heads, qo_len_i, kv_len_i]
@@ -291,7 +436,9 @@ def sink_attention_unified(
         return o_ref
 
     else:
-        raise ValueError(f"Unknown mode: {mode}. Supported modes: 'auto', 'prefill', 'incremental', 'chunk', 'varlen'")
+        raise ValueError(
+            f"Unknown mode: {mode}. Supported modes: 'auto', 'prefill', 'incremental', 'chunk', 'varlen'"
+        )
 
     # Build attention mask (unified for all modes)
     if causal:
@@ -303,21 +450,32 @@ def sink_attention_unified(
                 mask = (kv_len - 1 - window_left) <= col_idx
         elif mode == "prefill":
             # For regular prefill: standard causal mask
-            mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(1) >= \
-                   torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+            mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+                1
+            ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
             if window_left >= 0:
-                row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
-                col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+                row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[
+                    :, None
+                ]
+                col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[
+                    None, :
+                ]
                 mask &= row_idx - window_left <= col_idx
         elif mode == "chunk":
             # For chunk prefill: each query position can attend to all previous KV positions
             # Current chunk positions are at the end: [kv_len - qo_len : kv_len]
             current_chunk_start = kv_len - qo_len
-            row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]  # Positions within chunk
-            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]  # All KV positions
+            row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[
+                :, None
+            ]  # Positions within chunk
+            col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[
+                None, :
+            ]  # All KV positions
 
             # Each position can attend to: all historical + positions up to itself in current chunk
-            abs_row_positions = current_chunk_start + row_idx  # Absolute positions in full sequence
+            abs_row_positions = (
+                current_chunk_start + row_idx
+            )  # Absolute positions in full sequence
             mask = abs_row_positions >= col_idx  # Standard causal mask
 
             if window_left >= 0:
@@ -335,13 +493,21 @@ def sink_attention_unified(
                 if mode == "chunk":
                     # For chunk mode, apply window relative to absolute positions
                     current_chunk_start = kv_len - qo_len
-                    row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
-                    col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+                    row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[
+                        :, None
+                    ]
+                    col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[
+                        None, :
+                    ]
                     abs_row_positions = current_chunk_start + row_idx
                     mask = abs_row_positions - window_left <= col_idx
                 else:  # prefill
-                    row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[:, None]
-                    col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[None, :]
+                    row_idx = torch.arange(qo_len, dtype=torch.int32, device=q.device)[
+                        :, None
+                    ]
+                    col_idx = torch.arange(kv_len, dtype=torch.int32, device=q.device)[
+                        None, :
+                    ]
                     mask = row_idx - window_left <= col_idx
 
     # Apply mask
@@ -391,8 +557,15 @@ def sink_attention_ref(
 ) -> torch.Tensor:
     """Backward compatible wrapper for prefill mode."""
     return sink_attention_unified(
-        q, k, v, sink, window_left, causal, sm_scale,
-        batch_size=batch_size, mode="prefill"
+        q,
+        k,
+        v,
+        sink,
+        window_left,
+        causal,
+        sm_scale,
+        batch_size=batch_size,
+        mode="prefill",
     )
 
 
@@ -407,8 +580,7 @@ def sink_attention_incremental_ref(
 ) -> torch.Tensor:
     """Backward compatible wrapper for incremental mode."""
     return sink_attention_unified(
-        q, k_cache, v_cache, sink, window_left, causal, sm_scale,
-        mode="incremental"
+        q, k_cache, v_cache, sink, window_left, causal, sm_scale, mode="incremental"
     )
 
 
@@ -424,8 +596,15 @@ def sink_attention_chunk_ref(
 ) -> torch.Tensor:
     """Wrapper for chunk prefill mode."""
     return sink_attention_unified(
-        q, k, v, sink, window_left, causal, sm_scale,
-        batch_size=batch_size, mode="chunk"
+        q,
+        k,
+        v,
+        sink,
+        window_left,
+        causal,
+        sm_scale,
+        batch_size=batch_size,
+        mode="chunk",
     )
 
 
@@ -442,8 +621,16 @@ def sink_attention_varlen_ref(
 ) -> torch.Tensor:
     """Wrapper for variable length sequences mode."""
     return sink_attention_unified(
-        q, k, v, sink, window_left, causal, sm_scale,
-        mode="varlen", qo_indptr=qo_indptr, kv_indptr=kv_indptr
+        q,
+        k,
+        v,
+        sink,
+        window_left,
+        causal,
+        sm_scale,
+        mode="varlen",
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
     )
 
 
@@ -454,9 +641,13 @@ def sink_attention_varlen_ref(
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
 @pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 def test_attention_sink(
-    dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, window_left, causal
+    dtype, batch_size, seq_len, num_qo_heads, num_kv_heads, window_left, causal, backend
 ):
+
+    if backend == "fa3" and not is_sm90a_supported("cuda"):
+        pytest.skip("FA3 is not supported on this device")
     jit_args = (
         f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}",  # uri
         dtype,  # dtype_q
@@ -478,7 +669,7 @@ def test_attention_sink(
         128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
     )
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
     )
     qo_indptr_host = torch.arange(
         0, batch_size * seq_len + 1, seq_len, dtype=torch.int32
@@ -526,16 +717,14 @@ def test_attention_sink(
     sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 5
 
     o = wrapper.run(q, k, v, sink, sm_scale)
-    o_ref = sink_attention_ref(
-        batch_size, q, k, v, sink, window_left, causal, sm_scale
-    )
+    o_ref = sink_attention_ref(batch_size, q, k, v, sink, window_left, causal, sm_scale)
     if dtype == torch.float16:
         torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
     else:
         torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
 
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
     )
     kv_indices_host = torch.arange(
         0,
@@ -556,7 +745,7 @@ def test_attention_sink(
         window_left=window_left,
         q_data_type=dtype,
         kv_data_type=dtype,
-        non_blocking=True
+        non_blocking=True,
     )
     o_paged = wrapper_paged.run(q, (k, v), sink, sm_scale)
     if dtype == torch.float16:
@@ -569,9 +758,12 @@ def test_attention_sink(
     if total_pages > 1:  # Only test fragmentation when we have multiple pages
         # Create a fragmented page allocation pattern
         import random
+
         random.seed(42 + total_pages)  # Deterministic but varied seed
         all_pages = list(range(0, total_pages * 2))  # Larger page pool
-        occupied_pages = set(random.sample(all_pages, min(total_pages, len(all_pages) // 2)))
+        occupied_pages = set(
+            random.sample(all_pages, min(total_pages, len(all_pages) // 2))
+        )
         available_pages = [p for p in all_pages if p not in occupied_pages]
 
         # Allocate non-contiguous pages
@@ -581,12 +773,10 @@ def test_attention_sink(
 
         # Create new paged KV cache with larger capacity
         k_paged_frag = torch.randn(
-            total_pages * 2, 1, num_kv_heads, head_dim,
-            dtype=dtype, device="cuda"
+            total_pages * 2, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
         )
         v_paged_frag = torch.randn(
-            total_pages * 2, 1, num_kv_heads, head_dim,
-            dtype=dtype, device="cuda"
+            total_pages * 2, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
         )
 
         # Copy K,V data to fragmented pages
@@ -596,7 +786,7 @@ def test_attention_sink(
 
         # Test with fragmented indices
         wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
         )
         wrapper_paged_frag.plan(
             qo_indptr_host,
@@ -611,9 +801,11 @@ def test_attention_sink(
             window_left=window_left,
             q_data_type=dtype,
             kv_data_type=dtype,
-            non_blocking=True
+            non_blocking=True,
         )
-        o_paged_frag = wrapper_paged_frag.run(q, (k_paged_frag, v_paged_frag), sink, sm_scale)
+        o_paged_frag = wrapper_paged_frag.run(
+            q, (k_paged_frag, v_paged_frag), sink, sm_scale
+        )
 
         # Verify fragmented result matches reference
         if dtype == torch.float16:
@@ -630,14 +822,24 @@ def test_attention_sink(
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
 @pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 def test_attention_sink_incremental_generation(
-    dtype, batch_size, initial_seq_len, num_generation_steps,
-    num_qo_heads, num_kv_heads, window_left, causal
+    dtype,
+    batch_size,
+    initial_seq_len,
+    num_generation_steps,
+    num_qo_heads,
+    num_kv_heads,
+    window_left,
+    causal,
+    backend,
 ):
     """
     Test incremental generation scenario: q_len=1, kv_len grows gradually
     Simulate the token-by-token generation process in real large model inference
     """
+    if backend == "fa3" and not is_sm90a_supported("cuda"):
+        pytest.skip("FA3 is not supported on this device")
     head_dim = 128
     sm_scale = 1.0 / math.sqrt(head_dim)
 
@@ -646,10 +848,16 @@ def test_attention_sink_incremental_generation(
     # Create JIT arguments
     jit_args = (
         f"single_prefill_attention_sink_{filename_safe_dtype_map[dtype]}",
-        dtype, dtype, dtype, torch.int32,
-        head_dim, head_dim,
-        ["sink"], ["float"],
-        ["sm_scale"], ["double"],
+        dtype,
+        dtype,
+        dtype,
+        torch.int32,
+        head_dim,
+        head_dim,
+        ["sink"],
+        ["float"],
+        ["sm_scale"],
+        ["double"],
         "AttentionSink",
         attention_sink_decl,
     )
@@ -660,12 +868,10 @@ def test_attention_sink_incremental_generation(
 
     # Initialize KV cache - simulate state after prefill phase
     k_cache = torch.randn(
-        batch_size, initial_seq_len, num_kv_heads, head_dim,
-        dtype=dtype, device="cuda"
+        batch_size, initial_seq_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
     v_cache = torch.randn(
-        batch_size, initial_seq_len, num_kv_heads, head_dim,
-        dtype=dtype, device="cuda"
+        batch_size, initial_seq_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
 
     sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 5
@@ -676,18 +882,15 @@ def test_attention_sink_incremental_generation(
 
         # Current generated new token (q_len=1)
         q_new = torch.randn(
-            batch_size, num_qo_heads, head_dim,
-            dtype=dtype, device="cuda"
+            batch_size, num_qo_heads, head_dim, dtype=dtype, device="cuda"
         )
 
         # K,V for newly generated token
         k_new = torch.randn(
-            batch_size, 1, num_kv_heads, head_dim,
-            dtype=dtype, device="cuda"
+            batch_size, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
         )
         v_new = torch.randn(
-            batch_size, 1, num_kv_heads, head_dim,
-            dtype=dtype, device="cuda"
+            batch_size, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
         )
 
         # Update KV cache
@@ -700,17 +903,18 @@ def test_attention_sink_incremental_generation(
 
         # Calculate reference result
         o_ref = sink_attention_incremental_ref(
-            q_new, k_cache_current, v_cache_current,
-            sink, window_left, causal, sm_scale
+            q_new, k_cache_current, v_cache_current, sink, window_left, causal, sm_scale
         )
 
         # Use flashinfer to calculate result (need format conversion to adapt to existing API)
         wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
         )
 
         # Set correct indptr: q_len=1 for each batch, kv_len=current_kv_len for each batch
-        qo_indptr_host = torch.arange(0, batch_size + 1, dtype=torch.int32)  # [0, 1, 2, ..., batch_size]
+        qo_indptr_host = torch.arange(
+            0, batch_size + 1, dtype=torch.int32
+        )  # [0, 1, 2, ..., batch_size]
         kv_indptr_host = torch.arange(
             0, batch_size * current_kv_len + 1, current_kv_len, dtype=torch.int32
         )
@@ -728,9 +932,15 @@ def test_attention_sink_incremental_generation(
         )
 
         # Convert to format expected by flashinfer [total_q_len, num_heads, head_dim]
-        q_flashinfer = q_new.view(batch_size, num_qo_heads, head_dim)  # [batch_size, num_heads, head_dim]
-        k_flashinfer = k_cache_current.view(batch_size * current_kv_len, num_kv_heads, head_dim)
-        v_flashinfer = v_cache_current.view(batch_size * current_kv_len, num_kv_heads, head_dim)
+        q_flashinfer = q_new.view(
+            batch_size, num_qo_heads, head_dim
+        )  # [batch_size, num_heads, head_dim]
+        k_flashinfer = k_cache_current.view(
+            batch_size * current_kv_len, num_kv_heads, head_dim
+        )
+        v_flashinfer = v_cache_current.view(
+            batch_size * current_kv_len, num_kv_heads, head_dim
+        )
 
         o = wrapper.run(q_flashinfer, k_flashinfer, v_flashinfer, sink, sm_scale)
 
@@ -742,7 +952,7 @@ def test_attention_sink_incremental_generation(
 
         # Also test with BatchPrefillWithPagedKVCacheWrapper
         wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
         )
         kv_indices_host = torch.arange(
             0,
@@ -763,9 +973,11 @@ def test_attention_sink_incremental_generation(
             window_left=window_left,
             q_data_type=dtype,
             kv_data_type=dtype,
-            non_blocking=True
+            non_blocking=True,
         )
-        o_paged = wrapper_paged.run(q_flashinfer, (k_flashinfer, v_flashinfer), sink, sm_scale)
+        o_paged = wrapper_paged.run(
+            q_flashinfer, (k_flashinfer, v_flashinfer), sink, sm_scale
+        )
         if dtype == torch.float16:
             torch.testing.assert_close(o_paged, o_ref, rtol=1e-3, atol=1e-3)
         else:
@@ -776,9 +988,12 @@ def test_attention_sink_incremental_generation(
         if total_pages > 1:  # Only test fragmentation when we have multiple pages
             # Create fragmented page allocation pattern
             import random
+
             random.seed(42 + step + current_kv_len)  # Vary seed with step and length
             all_pages = list(range(0, total_pages * 2))
-            occupied_pages = set(random.sample(all_pages, min(total_pages, len(all_pages) // 2)))
+            occupied_pages = set(
+                random.sample(all_pages, min(total_pages, len(all_pages) // 2))
+            )
             available_pages = [p for p in all_pages if p not in occupied_pages]
 
             # Allocate non-contiguous pages
@@ -788,12 +1003,10 @@ def test_attention_sink_incremental_generation(
 
             # Create fragmented paged KV cache
             k_paged_frag = torch.randn(
-                total_pages * 2, 1, num_kv_heads, head_dim,
-                dtype=dtype, device="cuda"
+                total_pages * 2, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
             )
             v_paged_frag = torch.randn(
-                total_pages * 2, 1, num_kv_heads, head_dim,
-                dtype=dtype, device="cuda"
+                total_pages * 2, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
             )
 
             # Copy K,V data to fragmented pages
@@ -803,7 +1016,10 @@ def test_attention_sink_incremental_generation(
 
             # Test with fragmented indices
             wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+                float_workspace_buffer,
+                kv_layout="NHD",
+                backend=backend,
+                jit_args=jit_args,
             )
             wrapper_paged_frag.plan(
                 qo_indptr_host,
@@ -818,9 +1034,11 @@ def test_attention_sink_incremental_generation(
                 window_left=window_left,
                 q_data_type=dtype,
                 kv_data_type=dtype,
-                non_blocking=True
+                non_blocking=True,
             )
-            o_paged_frag = wrapper_paged_frag.run(q_flashinfer, (k_paged_frag, v_paged_frag), sink, sm_scale)
+            o_paged_frag = wrapper_paged_frag.run(
+                q_flashinfer, (k_paged_frag, v_paged_frag), sink, sm_scale
+            )
 
             # Verify fragmented result matches reference
             if dtype == torch.float16:
@@ -836,7 +1054,9 @@ def test_attention_sink_incremental_generation(
             k_accumulated = torch.cat([k_accumulated, k_new], dim=1)
             v_accumulated = torch.cat([v_accumulated, v_new], dim=1)
 
-        print(f"Step {step}: q_len=1, kv_len={current_kv_len}, both RaggedKV and PagedKV wrappers passed!")
+        print(
+            f"Step {step}: q_len=1, kv_len={current_kv_len}, both RaggedKV and PagedKV wrappers passed!"
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -847,18 +1067,30 @@ def test_attention_sink_incremental_generation(
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
 @pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 def test_attention_sink_chunk_prefill(
-    dtype, batch_size, chunk_size, historical_len,
-    num_qo_heads, num_kv_heads, window_left, causal
+    dtype,
+    batch_size,
+    chunk_size,
+    historical_len,
+    num_qo_heads,
+    num_kv_heads,
+    window_left,
+    causal,
+    backend,
 ):
     """
     Test chunk prefill scenario: q_len != kv_len and q_len > 1
     Simulate chunk-based processing of long sequences where current chunk
     attends to all historical tokens plus current chunk tokens
     """
+    if backend == "fa3" and not is_sm90a_supported("cuda"):
+        pytest.skip("FA3 is not supported on this device")
     # Skip invalid combinations
     if chunk_size >= historical_len:
-        pytest.skip("chunk_size should be smaller than historical_len for meaningful chunk prefill test")
+        pytest.skip(
+            "chunk_size should be smaller than historical_len for meaningful chunk prefill test"
+        )
 
     head_dim = 128
     sm_scale = 1.0 / math.sqrt(head_dim)
@@ -868,10 +1100,16 @@ def test_attention_sink_chunk_prefill(
     # Create JIT arguments
     jit_args = (
         f"chunk_prefill_attention_sink_{filename_safe_dtype_map[dtype]}",
-        dtype, dtype, dtype, torch.int32,
-        head_dim, head_dim,
-        ["sink"], ["float"],
-        ["sm_scale"], ["double"],
+        dtype,
+        dtype,
+        dtype,
+        torch.int32,
+        head_dim,
+        head_dim,
+        ["sink"],
+        ["float"],
+        ["sm_scale"],
+        ["double"],
         "AttentionSink",
         attention_sink_decl,
     )
@@ -883,31 +1121,27 @@ def test_attention_sink_chunk_prefill(
     # Create input tensors for chunk prefill scenario
     # q represents current chunk: [batch_size * chunk_size, num_heads, head_dim]
     q_chunk = torch.randn(
-        batch_size * chunk_size, num_qo_heads, head_dim,
-        dtype=dtype, device="cuda"
+        batch_size * chunk_size, num_qo_heads, head_dim, dtype=dtype, device="cuda"
     )
 
     # k, v represent all tokens (historical + current chunk)
     k_all = torch.randn(
-        batch_size * total_kv_len, num_kv_heads, head_dim,
-        dtype=dtype, device="cuda"
+        batch_size * total_kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
     v_all = torch.randn(
-        batch_size * total_kv_len, num_kv_heads, head_dim,
-        dtype=dtype, device="cuda"
+        batch_size * total_kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda"
     )
 
     sink = torch.rand(num_qo_heads, device="cuda", dtype=torch.float32) * 5
 
     # Calculate reference result using chunk prefill mode
     o_ref = sink_attention_chunk_ref(
-        batch_size, q_chunk, k_all, v_all,
-        sink, window_left, causal, sm_scale
+        batch_size, q_chunk, k_all, v_all, sink, window_left, causal, sm_scale
     )
 
     # Test with flashinfer
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
     )
 
     # Set up indices for chunk prefill
@@ -940,7 +1174,7 @@ def test_attention_sink_chunk_prefill(
 
     # Also test with BatchPrefillWithPagedKVCacheWrapper
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
     )
     kv_indices_host = torch.arange(
         0,
@@ -961,7 +1195,7 @@ def test_attention_sink_chunk_prefill(
         window_left=window_left,
         q_data_type=dtype,
         kv_data_type=dtype,
-        non_blocking=True
+        non_blocking=True,
     )
     o_paged = wrapper_paged.run(q_chunk, (k_all, v_all), sink, sm_scale)
     if dtype == torch.float16:
@@ -974,9 +1208,14 @@ def test_attention_sink_chunk_prefill(
     if total_pages > 1:  # Only test fragmentation when we have multiple pages
         # Create fragmented page allocation pattern
         import random
-        random.seed(42 + batch_size + total_kv_len)  # Vary seed with batch and total length
+
+        random.seed(
+            42 + batch_size + total_kv_len
+        )  # Vary seed with batch and total length
         all_pages = list(range(0, total_pages * 2))
-        occupied_pages = set(random.sample(all_pages, min(total_pages, len(all_pages) // 2)))
+        occupied_pages = set(
+            random.sample(all_pages, min(total_pages, len(all_pages) // 2))
+        )
         available_pages = [p for p in all_pages if p not in occupied_pages]
 
         # Allocate non-contiguous pages
@@ -986,12 +1225,10 @@ def test_attention_sink_chunk_prefill(
 
         # Create fragmented paged KV cache
         k_paged_frag = torch.randn(
-            total_pages * 2, 1, num_kv_heads, head_dim,
-            dtype=dtype, device="cuda"
+            total_pages * 2, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
         )
         v_paged_frag = torch.randn(
-            total_pages * 2, 1, num_kv_heads, head_dim,
-            dtype=dtype, device="cuda"
+            total_pages * 2, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
         )
 
         # Copy K,V data to fragmented pages
@@ -1001,7 +1238,7 @@ def test_attention_sink_chunk_prefill(
 
         # Test with fragmented indices
         wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
         )
         wrapper_paged_frag.plan(
             qo_indptr_host,
@@ -1016,9 +1253,11 @@ def test_attention_sink_chunk_prefill(
             window_left=window_left,
             q_data_type=dtype,
             kv_data_type=dtype,
-            non_blocking=True
+            non_blocking=True,
         )
-        o_paged_frag = wrapper_paged_frag.run(q_chunk, (k_paged_frag, v_paged_frag), sink, sm_scale)
+        o_paged_frag = wrapper_paged_frag.run(
+            q_chunk, (k_paged_frag, v_paged_frag), sink, sm_scale
+        )
 
         # Verify fragmented result matches reference
         if dtype == torch.float16:
@@ -1026,36 +1265,62 @@ def test_attention_sink_chunk_prefill(
         else:
             torch.testing.assert_close(o_paged_frag, o_ref, rtol=1e-2, atol=1e-2)
 
-    print(f"Chunk prefill test passed: q_len={chunk_size}, kv_len={total_kv_len}, "
-          f"batch_size={batch_size}, causal={causal}")
+    print(
+        f"Chunk prefill test passed: q_len={chunk_size}, kv_len={total_kv_len}, "
+        f"batch_size={batch_size}, causal={causal}"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("indptr_config", [
-    # (qo_indptr, kv_indptr, description)
-    ([0, 32, 64, 128, 256], [0, 128, 256, 512, 1024], "4 requests: prefill-like scenarios"),
-    ([0, 1, 2, 3, 4], [0, 128, 256, 384, 512], "4 requests: incremental generation"),
-    ([0, 50, 150, 200], [0, 200, 600, 800], "3 requests: mixed lengths"),
-    ([0, 100, 200, 400, 600, 1000], [0, 300, 600, 1200, 1800, 3000], "5 requests: large sequences"),
-    ([0, 16, 32, 96, 128], [0, 64, 128, 384, 512], "4 requests: chunk prefill-like"),
-])
+@pytest.mark.parametrize(
+    "indptr_config",
+    [
+        # (qo_indptr, kv_indptr, description)
+        (
+            [0, 32, 64, 128, 256],
+            [0, 128, 256, 512, 1024],
+            "4 requests: prefill-like scenarios",
+        ),
+        (
+            [0, 1, 2, 3, 4],
+            [0, 128, 256, 384, 512],
+            "4 requests: incremental generation",
+        ),
+        ([0, 50, 150, 200], [0, 200, 600, 800], "3 requests: mixed lengths"),
+        (
+            [0, 100, 200, 400, 600, 1000],
+            [0, 300, 600, 1200, 1800, 3000],
+            "5 requests: large sequences",
+        ),
+        (
+            [0, 16, 32, 96, 128],
+            [0, 64, 128, 384, 512],
+            "4 requests: chunk prefill-like",
+        ),
+    ],
+)
 @pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
 @pytest.mark.parametrize("window_left", [-1, 128])
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 def test_attention_sink_varlen(
-    dtype, indptr_config, num_qo_heads, num_kv_heads, window_left, causal
+    dtype, indptr_config, num_qo_heads, num_kv_heads, window_left, causal, backend
 ):
     """
     Test variable length sequences within a batch.
     Each request in the batch can have different query and key/value lengths.
     """
+    if backend == "fa3" and not is_sm90a_supported("cuda"):
+        pytest.skip("FA3 is not supported on this device")
     # Unpack the indptr configuration
     qo_indptr, kv_indptr, description = indptr_config
 
     # Validate that qo_indptr and kv_indptr have same batch size
     if len(qo_indptr) != len(kv_indptr):
-        pytest.skip(f"qo_indptr and kv_indptr must have same batch size for {description}")
+        pytest.skip(
+            f"qo_indptr and kv_indptr must have same batch size for {description}"
+        )
 
     batch_size = len(qo_indptr) - 1
     total_qo_len = qo_indptr[-1]
@@ -1070,21 +1335,14 @@ def test_attention_sink_varlen(
             qo_len_i = qo_indptr[i + 1] - qo_indptr[i]
             kv_len_i = kv_indptr[i + 1] - kv_indptr[i]
             if qo_len_i > kv_len_i:
-                pytest.skip("qo_len > kv_len not supported for causal attention in varlen mode")
+                pytest.skip(
+                    "qo_len > kv_len not supported for causal attention in varlen mode"
+                )
 
     # Create input tensors
-    q = torch.randn(
-        total_qo_len, num_qo_heads, head_dim,
-        dtype=dtype, device="cuda"
-    )
-    k = torch.randn(
-        total_kv_len, num_kv_heads, head_dim,
-        dtype=dtype, device="cuda"
-    )
-    v = torch.randn(
-        total_kv_len, num_kv_heads, head_dim,
-        dtype=dtype, device="cuda"
-    )
+    q = torch.randn(total_qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda")
+    k = torch.randn(total_kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda")
+    v = torch.randn(total_kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda")
 
     qo_indptr_tensor = torch.tensor(qo_indptr, dtype=torch.int32, device="cuda")
     kv_indptr_tensor = torch.tensor(kv_indptr, dtype=torch.int32, device="cuda")
@@ -1093,13 +1351,15 @@ def test_attention_sink_varlen(
 
     # Test the variable length reference implementation
     o_ref = sink_attention_varlen_ref(
-        q, k, v, sink, window_left, causal, sm_scale,
-        qo_indptr_tensor, kv_indptr_tensor
+        q, k, v, sink, window_left, causal, sm_scale, qo_indptr_tensor, kv_indptr_tensor
     )
 
     # Verify output shape
-    assert o_ref.shape == (total_qo_len, num_qo_heads, head_dim), \
-        f"Expected shape ({total_qo_len}, {num_qo_heads}, {head_dim}), got {o_ref.shape}"
+    assert o_ref.shape == (
+        total_qo_len,
+        num_qo_heads,
+        head_dim,
+    ), f"Expected shape ({total_qo_len}, {num_qo_heads}, {head_dim}), got {o_ref.shape}"
 
     # Test against FlashInfer kernel for verification
     # Create JIT arguments for attention sink
@@ -1126,7 +1386,7 @@ def test_attention_sink_varlen(
 
     # Test with BatchPrefillWithRaggedKVCacheWrapper
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
     )
 
     wrapper.plan(
@@ -1151,15 +1411,12 @@ def test_attention_sink_varlen(
 
     # Also test with BatchPrefillWithPagedKVCacheWrapper
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+        float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
     )
-    kv_indices_host = torch.arange(
-        0,
-        total_kv_len,
-        dtype=torch.int32,
-        device="cuda"
+    kv_indices_host = torch.arange(0, total_kv_len, dtype=torch.int32, device="cuda")
+    paged_kv_last_page_len_host = torch.full(
+        (batch_size,), 1, dtype=torch.int32, device="cuda"
     )
-    paged_kv_last_page_len_host = torch.full((batch_size,), 1, dtype=torch.int32, device="cuda")
     wrapper_paged.plan(
         qo_indptr_tensor,
         kv_indptr_tensor,
@@ -1173,7 +1430,7 @@ def test_attention_sink_varlen(
         window_left=window_left,
         q_data_type=dtype,
         kv_data_type=dtype,
-        non_blocking=True
+        non_blocking=True,
     )
     o_paged = wrapper_paged.run(q, (k, v), sink, sm_scale)
     if dtype == torch.float16:
@@ -1186,9 +1443,14 @@ def test_attention_sink_varlen(
     if total_pages > 1:  # Only test fragmentation when we have multiple pages
         # Create fragmented page allocation pattern
         import random
-        random.seed(42 + batch_size + total_kv_len)  # Vary seed with batch and total length
+
+        random.seed(
+            42 + batch_size + total_kv_len
+        )  # Vary seed with batch and total length
         all_pages = list(range(0, total_pages * 2))
-        occupied_pages = set(random.sample(all_pages, min(total_pages, len(all_pages) // 2)))
+        occupied_pages = set(
+            random.sample(all_pages, min(total_pages, len(all_pages) // 2))
+        )
         available_pages = [p for p in all_pages if p not in occupied_pages]
 
         # Allocate non-contiguous pages
@@ -1198,12 +1460,10 @@ def test_attention_sink_varlen(
 
         # Create fragmented paged KV cache
         k_paged_frag = torch.randn(
-            total_pages * 2, 1, num_kv_heads, head_dim,
-            dtype=dtype, device="cuda"
+            total_pages * 2, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
         )
         v_paged_frag = torch.randn(
-            total_pages * 2, 1, num_kv_heads, head_dim,
-            dtype=dtype, device="cuda"
+            total_pages * 2, 1, num_kv_heads, head_dim, dtype=dtype, device="cuda"
         )
 
         # Copy K,V data to fragmented pages
@@ -1213,7 +1473,7 @@ def test_attention_sink_varlen(
 
         # Test with fragmented indices
         wrapper_paged_frag = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer, kv_layout="NHD", backend="fa2", jit_args=jit_args
+            float_workspace_buffer, kv_layout="NHD", backend=backend, jit_args=jit_args
         )
         wrapper_paged_frag.plan(
             qo_indptr_tensor,
@@ -1228,9 +1488,11 @@ def test_attention_sink_varlen(
             window_left=window_left,
             q_data_type=dtype,
             kv_data_type=dtype,
-            non_blocking=True
+            non_blocking=True,
         )
-        o_paged_frag = wrapper_paged_frag.run(q, (k_paged_frag, v_paged_frag), sink, sm_scale)
+        o_paged_frag = wrapper_paged_frag.run(
+            q, (k_paged_frag, v_paged_frag), sink, sm_scale
+        )
 
         # Verify fragmented result matches reference
         if dtype == torch.float16:
@@ -1238,10 +1500,12 @@ def test_attention_sink_varlen(
         else:
             torch.testing.assert_close(o_ref, o_paged_frag, rtol=1e-2, atol=1e-2)
 
-    print(f"Variable length test passed: {description}, batch_size={batch_size}, "
-          f"qo_lens={[qo_indptr[i+1]-qo_indptr[i] for i in range(batch_size)]}, "
-          f"kv_lens={[kv_indptr[i+1]-kv_indptr[i] for i in range(batch_size)]}, "
-          f"causal={causal}")
+    print(
+        f"Variable length test passed: {description}, batch_size={batch_size}, "
+        f"qo_lens={[qo_indptr[i+1]-qo_indptr[i] for i in range(batch_size)]}, "
+        f"kv_lens={[kv_indptr[i+1]-kv_indptr[i] for i in range(batch_size)]}, "
+        f"causal={causal}"
+    )
 
 
 if __name__ == "__main__":
