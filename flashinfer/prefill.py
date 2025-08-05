@@ -88,6 +88,83 @@ def get_fmha_module(
         raise ValueError("SM100A is not supported on this device")
 
 
+def make_hashable_cache(func):
+    """
+    Decorator that converts unhashable arguments (like lists) to hashable ones (tuples)
+    before applying functools.cache.
+    """
+
+    @functools.cache
+    def cached_wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # Convert unhashable arguments to hashable ones
+        hashable_args = []
+        for arg in args:
+            if isinstance(arg, list):
+                hashable_args.append(tuple(arg))
+            else:
+                hashable_args.append(arg)
+
+        hashable_kwargs = {}
+        for key, value in kwargs.items():
+            if isinstance(value, list):
+                hashable_kwargs[key] = tuple(value)
+            else:
+                hashable_kwargs[key] = value
+
+        return cached_wrapper(*hashable_args, **hashable_kwargs)
+
+    return wrapper
+
+
+@make_hashable_cache
+def get_customize_batch_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+):
+    return gen_customize_batch_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
+    ).build_and_load()
+
+
 @functools.cache
 def get_trtllm_gen_prefill_module():
     mod = trtllm_gen_fmha_module()
@@ -1305,9 +1382,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if jit_args is not None:
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(
-                    backend, *jit_args, **jit_kwargs
-                ).build_and_load(),
+                get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
         else:
             self._jit_module = None
@@ -2223,9 +2298,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if jit_args is not None:
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(
-                    backend, *jit_args, **jit_kwargs
-                ).build_and_load(),
+                get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
         else:
             self._jit_module = None

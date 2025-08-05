@@ -1,3 +1,4 @@
+import functools
 import math
 from typing import Optional
 
@@ -162,6 +163,40 @@ attention_sink_decl = {
     "fa2": attention_sink_fa2_decl,
     "fa3": attention_sink_fa3_decl,
 }
+
+
+@pytest.fixture(autouse=True, scope="module")
+def warmup_jit():
+    jit_specs = []
+    for dtype in [torch.float16, torch.bfloat16]:
+        for backend in ["fa2", "fa3"]:
+            for use_swa in [True, False]:
+                for head_dim in [128]:
+                    jit_args = (
+                        f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{use_swa}_{backend}",
+                        dtype,
+                        dtype,
+                        dtype,
+                        torch.int32,
+                        head_dim,
+                        head_dim,
+                        ["sink"],
+                        ["float"],
+                        ["sm_scale"],
+                        ["double"],
+                        "AttentionSink",
+                        attention_sink_decl[backend],
+                    )
+                    jit_kwargs = {
+                        "use_sliding_window": use_swa,
+                    }
+                    jit_spec = flashinfer.jit.gen_customize_batch_prefill_module(
+                        backend, *jit_args, **jit_kwargs
+                    )
+                    jit_specs.append(jit_spec)
+
+    flashinfer.jit.build_jit_specs(jit_specs)
+    yield
 
 
 def sink_softmax(logits, sink):
@@ -871,7 +906,7 @@ def test_attention_sink_incremental_generation(
 
     # Create JIT arguments
     jit_args = (
-        f"single_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",
+        f"batch_prefill_attention_sink_{filename_safe_dtype_map[dtype]}_swa_{window_left >= 0}_{backend}",
         dtype,
         dtype,
         dtype,
