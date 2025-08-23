@@ -89,6 +89,7 @@ jobs:
           python -m venv test-env
           source test-env/bin/activate
           pip install dist/*.tar.gz
+          pip install packaging>=24.2
           python -c "import flashinfer; print(f'✓ Successfully imported flashinfer')"
           deactivate
           rm -rf test-env
