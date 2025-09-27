@@ -30,6 +30,7 @@
  **************************************************************************************************/
 #pragma once
 
+#include "../../../math.cuh"
 #include "cute/arch/simd_sm100.hpp"
 #include "cute/layout.hpp"
 #include "cute/tensor.hpp"
@@ -599,11 +600,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       float2 in = make_float2(tTMEM_LOADrS(i + 0), tTMEM_LOADrS(i + 1));
       float2 out;
       cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
+      // tTMEM_LOADrS(i + 0) = out.x;
+      // tTMEM_LOADrS(i + 1) = out.y;
+
+      // tTMEM_LOADrS(i + 0) = ::exp2f(tTMEM_LOADrS(i + 0));
+      // tTMEM_LOADrS(i + 1) = ::exp2f(tTMEM_LOADrS(i + 1));
+      out = flashinfer::math::ex2_emulation_2(out);
       tTMEM_LOADrS(i + 0) = out.x;
       tTMEM_LOADrS(i + 1) = out.y;
-
-      tTMEM_LOADrS(i + 0) = ::exp2f(tTMEM_LOADrS(i + 0));
-      tTMEM_LOADrS(i + 1) = ::exp2f(tTMEM_LOADrS(i + 1));
 
       Array<ElementQK, kConversionsPerStep> in_conv;
       CUTLASS_PRAGMA_UNROLL
