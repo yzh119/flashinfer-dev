@@ -20,7 +20,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <cute/arch/simd_sm100.hpp>
 
 namespace flashinfer {
 namespace math {
@@ -152,45 +151,83 @@ __forceinline__ __device__ half tanh(half x) {
   return __ushort_as_half(y_u16);
 }
 
-#include <cuda_runtime.h>
+namespace simd {
 
-#include <cute/arch/simd_sm100.hpp>
+CUTE_HOST_DEVICE
+void add(float2& c, float2 const& a, float2 const& b) {
+#if defined(CUTE_ARCH_FLOAT2_MATH_ENABLED)
+  asm volatile("add.rn.f32x2 %0, %1, %2;\n"
+               : "=l"(reinterpret_cast<uint64_t&>(c))
+               : "l"(reinterpret_cast<uint64_t const&>(a)),
+                 "l"(reinterpret_cast<uint64_t const&>(b)));
+#else
+  c.x = a.x + b.x;
+  c.y = a.y + b.y;
+#endif
+}
 
-using namespace cute;
+CUTE_HOST_DEVICE
+void sub(float2& c, float2 const& a, float2 const& b) {
+#if defined(CUTE_ARCH_FLOAT2_MATH_ENABLED)
+  asm volatile("sub.rn.f32x2 %0, %1, %2;\n"
+               : "=l"(reinterpret_cast<uint64_t&>(c))
+               : "l"(reinterpret_cast<uint64_t const&>(a)),
+                 "l"(reinterpret_cast<uint64_t const&>(b)));
+#else
+  c.x = a.x - b.x;
+  c.y = a.y - b.y;
+#endif
+}
 
-// constexpr float poly_ex2_deg3[4] = {
-//     1.0f,
-//     0.695146143436431884765625f,
-//     0.227564394474029541015625f,
-//     0.077119089663028717041015625f
-// };
+CUTE_HOST_DEVICE
+void mul(float2& c, float2 const& a, float2 const& b) {
+#if defined(CUTE_ARCH_FLOAT2_MATH_ENABLED)
+  asm volatile("mul.rn.f32x2 %0, %1, %2;\n"
+               : "=l"(reinterpret_cast<uint64_t&>(c))
+               : "l"(reinterpret_cast<uint64_t const&>(a)),
+                 "l"(reinterpret_cast<uint64_t const&>(b)));
+#else
+  c.x = a.x * b.x;
+  c.y = a.y * b.y;
+#endif
+}
+
+CUTE_HOST_DEVICE
+void fma(float2& d, float2 const& a, float2 const& b, float2 const& c) {
+#if defined(CUTE_ARCH_FLOAT2_MATH_ENABLED)
+  asm volatile("fma.rn.f32x2 %0, %1, %2, %3;\n"
+               : "=l"(reinterpret_cast<uint64_t&>(d))
+               : "l"(reinterpret_cast<uint64_t const&>(a)),
+                 "l"(reinterpret_cast<uint64_t const&>(b)),
+                 "l"(reinterpret_cast<uint64_t const&>(c)));
+#else
+  d.x = fmaf(a.x, b.x, c.x);
+  d.y = fmaf(a.y, b.y, c.y);
+#endif
+}
+
+}  // namespace simd
 
 // Evaluate polynomial for single float with template degree
 template <int DEG>
-__device__ __forceinline__ float evaluate_polynomial(
-    float x) {  //, constexpr float (&poly)[DEG+1]) {
-  constexpr float poly_ex2_deg3[4] = {1.0f, 0.695146143436431884765625f,
-                                      0.227564394474029541015625f, 0.077119089663028717041015625f};
-  float out = poly_ex2_deg3[DEG];
+__device__ __forceinline__ float evaluate_polynomial(float x, const float (&poly)[DEG + 1]) {
+  float out = poly[DEG];
 #pragma unroll
   for (int i = DEG - 1; i >= 0; i--) {
-    out = out * x + poly_ex2_deg3[i];
+    out = out * x + poly[i];
   }
   return out;
 }
 
 // Evaluate polynomial for float2 (vectorized version) with template degree
 template <int DEG>
-__device__ __forceinline__ float2
-evaluate_polynomial_2(float2 xy) {  //}, constexpr float (&poly)[DEG+1]) {
-  constexpr float poly_ex2_deg3[4] = {1.0f, 0.695146143436431884765625f,
-                                      0.227564394474029541015625f, 0.077119089663028717041015625f};
-  float2 out = make_float2(poly_ex2_deg3[DEG], poly_ex2_deg3[DEG]);
+__device__ __forceinline__ float2 evaluate_polynomial_2(float2 xy, const float (&poly)[DEG + 1]) {
+  float2 out = make_float2(poly[DEG], poly[DEG]);
 #pragma unroll
   for (int i = DEG - 1; i >= 0; i--) {
-    float2 poly_broadcast = make_float2(poly_ex2_deg3[i], poly_ex2_deg3[i]);
+    float2 poly_broadcast = make_float2(poly[i], poly[i]);
     float2 temp;
-    cute::fma(temp, out, xy, poly_broadcast);
+    simd::fma(temp, out, xy, poly_broadcast);
     out = temp;
   }
   return out;
@@ -239,15 +276,17 @@ __device__ __forceinline__ float ex2_emulation(float x) {
   float x_frac = x_clamped - x_rounded_back;
 
   // Evaluate polynomial on fractional part
-  float x_frac_ex2 = evaluate_polynomial<3>(x_frac);  //, poly_ex2_deg3);
+  float x_frac_ex2 = evaluate_polynomial<3>(x_frac, poly_ex2_deg3);
 
   // Combine integer and fractional parts
   return combine_int_frac_ex2(x_rounded, x_frac_ex2);
 }
 
-// Vectorized float2 ex2 emulation using cute SIMD operations
+// Vectorized float2 ex2 emulation using flashinfer SIMD operations
 __device__ __forceinline__ float2 ex2_emulation_2(float2 xy) {
   // Polynomial coefficients for ex2 approximation (degree 3)
+  constexpr float poly_ex2_deg3[4] = {1.0f, 0.695146143436431884765625f,
+                                      0.227564394474029541015625f, 0.077119089663028717041015625f};
 
   const float fp32_round_int = float(1 << 23) + float(1 << 22);  // 2^23 + 2^22
   const float2 fp32_round_int_vec = make_float2(fp32_round_int, fp32_round_int);
@@ -256,24 +295,22 @@ __device__ __forceinline__ float2 ex2_emulation_2(float2 xy) {
   // Clamp x and y to prevent overflow
   float2 xy_clamped = make_float2(fmaxf(xy.x, -127.0f), fmaxf(xy.y, -127.0f));
 
-  // Round down using cute SIMD operations with round-down mode
+  // Round down using component-wise operations (need round-down mode)
   float2 xy_rounded;
-  // Note: cute::add with rounding mode might need specific implementation
-  // For now, using component-wise round down
   xy_rounded.x = add_round_down(xy_clamped.x, fp32_round_int);
   xy_rounded.y = add_round_down(xy_clamped.y, fp32_round_int);
 
-  // Extract fractional parts using cute SIMD operations
+  // Extract fractional parts using flashinfer SIMD operations with rn rounding
   float2 xy_rounded_back;
   float2 neg_round_int = make_float2(-fp32_round_int, -fp32_round_int);
-  cute::add(xy_rounded_back, xy_rounded, neg_round_int);
+  simd::add(xy_rounded_back, xy_rounded, neg_round_int);
 
   float2 xy_frac;
   float2 neg_rounded_back = make_float2(-xy_rounded_back.x, -xy_rounded_back.y);
-  cute::add(xy_frac, xy_clamped, neg_rounded_back);
+  simd::sub(xy_frac, xy_clamped, xy_rounded_back);
 
   // Evaluate polynomial on fractional parts (vectorized)
-  float2 xy_frac_ex2 = evaluate_polynomial_2<3>(xy_frac);  //, poly_ex2_deg3);
+  float2 xy_frac_ex2 = evaluate_polynomial_2<3>(xy_frac, poly_ex2_deg3);
 
   // Combine integer and fractional parts for both components
   float x_out = combine_int_frac_ex2(xy_rounded.x, xy_frac_ex2.x);
