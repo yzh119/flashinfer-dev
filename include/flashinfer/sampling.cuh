@@ -1749,6 +1749,132 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   }
 }
 
+__device__ __forceinline__ uint32_t order_preserving_convert(float v) {
+  uint32_t x = __float_as_int(v);
+  uint32_t mask = (x & 0x80000000) ? 0xffffffff : 0x80000000;
+  return (v == v) ? (x ^ mask) : 0xffffffff;
+}
+
+__device__ __forceinline__ float deconvert_to_float(uint32_t v) {
+  uint32_t mask = (v & 0x80000000) ? 0x80000000 : 0xffffffff;
+  return __int_as_float(v ^ mask);
+}
+
+template <uint32_t RADIX_BITS>
+__device__ __forceinline__ uint32_t extract_radix_bits(uint32_t v, uint32_t radix_pos) {
+  return (v >> (32 - RADIX_BITS - radix_pos)) & ((1 << RADIX_BITS) - 1);
+}
+
+template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t RADIX_BITS>
+struct RadixTopKTempStorage {
+  typename BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_int;
+  uint32_t pivot_u32;
+  bool early_exit;
+};
+
+template <uint32_t RADIX_BITS, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM,
+          uint32_t VEC_SIZE, typename DType, typename IdType>
+__device__ __forceinline__ DType RadixTopKFindPivot(
+    DType* logits, uint32_t k,
+    RadixTopKTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM, RADIX_BITS>* temp_storage, uint32_t d) {
+  constexpr uint32_t NBITS = sizeof(DType) * 8;
+  constexpr uint32_t HIST_SIZE = 1 << RADIX_BITS;
+  int threadlocal_hist[HIST_SIZE];
+  uint32_t pivot_u32 = 0;
+#pragma unroll
+  for (uint32_t radix_pos = 0; radix_pos < NBITS; radix_pos += RADIX_BITS) {
+#pragma unroll
+    for (uint32_t hist_idx = 0; hist_idx < HIST_SIZE; ++hist_idx) {
+      threadlocal_hist[hist_idx] = 0;
+    }
+#pragma unroll 1
+    for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+      uint32_t radix_bits_vec[VEC_SIZE];
+      if ((i * BLOCK_THREADS + threadIdx.x) * VEC_SIZE < d) {
+        vec_t<float, VEC_SIZE> logits_vec;
+        logits_vec.fill(0);
+        logits_vec.cast_load(logits + i * BLOCK_THREADS * VEC_SIZE + threadIdx.x * VEC_SIZE);
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          uint32_t as_uint = order_preserving_convert(logits_vec[j]);
+          if (as_uint >= pivot_u32) {
+            radix_bits_vec[j] = extract_radix_bits<RADIX_BITS>(as_uint, radix_pos);
+            threadlocal_hist[radix_bits_vec[j]]++;
+          }
+        }
+      }
+    }
+
+    // accumulate threadlocal histogram to block histogram
+#pragma unroll
+    for (uint32_t hist_idx = HIST_SIZE - 1; hist_idx >= 0; --hist_idx) {
+      int block_hist_value =
+          BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->reduce_int)
+              .Sum(threadlocal_hist[hist_idx]);
+      if (threadIdx.x == 0) {
+        if (block_hist_value >= k) {
+          pivot_u32 += hist_idx << (NBITS - RADIX_BITS - radix_pos);
+          temp_storage->pivot_u32 = pivot_u32;
+          temp_storage->early_exit = true;
+        }
+      }
+      __syncthreads();
+      pivot_u32 = temp_storage->pivot_u32;
+      if (temp_storage->early_exit) {
+        if (threadIdx.x == 0) {
+          temp_storage->early_exit = false;
+        }
+        break;
+      } else {
+        k -= block_hist_value;
+      }
+    }
+  }
+  return deconvert_to_float(temp_storage->pivot_u32);
+}
+
+template <uint32_t RADIX_BITS, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM,
+          uint32_t VEC_SIZE, typename DType, typename IdType>
+__global__ void RadixTopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType* top_k_arr,
+                                          uint32_t top_k_val, uint32_t d) {
+  const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+  const uint32_t row_idx = bx;
+  uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
+
+  extern __shared__ __align__(
+      alignof(RadixTopKTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM, RADIX_BITS>))
+      uint8_t smem_radix_top_k[];
+  auto& temp_storage =
+      reinterpret_cast<RadixTopKTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM, RADIX_BITS>&>(
+          smem_radix_top_k);
+  if (tx == 0) {
+    temp_storage.pivot_u32 = 0;
+    temp_storage.early_exit = false;
+  }
+  __syncthreads();
+  DType pivot =
+      RadixTopKFindPivot<RADIX_BITS, BLOCK_THREADS, REDUCE_ALGORITHM, VEC_SIZE, DType, IdType>(
+          logits + row_idx * d, k, &temp_storage, d);
+
+  // masking
+#pragma unroll 2
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    vec_t<float, VEC_SIZE> logits_vec;
+    logits_vec.fill(0);
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      logits_vec[j] =
+          (logits_vec[j] > pivot) ? logits_vec[j] : -cuda::std::numeric_limits<float>::infinity();
+    }
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      logits_vec.store(masked_logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+  }
+}
+
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType, typename IdType>
 __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType* top_k_arr,
@@ -2051,19 +2177,42 @@ cudaError_t TopKMaskLogits(DType* logits, DType* masked_logits, IdType* top_k_ar
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   auto compute_capacity = GetCudaComputeCapability();
-  DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
-    const uint32_t smem_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>);
-    dim3 nblks(batch_size);
-    dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&logits, &masked_logits, &top_k_arr, &top_k_val, &d};
-    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-      auto kernel = TopKMaskLogitsKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+  if (false) {
+    DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
+      const uint32_t smem_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>);
+      dim3 nblks(batch_size);
+      dim3 nthrs(BLOCK_THREADS);
+      void* args[] = {&logits, &masked_logits, &top_k_arr, &top_k_val, &d};
+      DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+        auto kernel = TopKMaskLogitsKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      });
+      return cudaSuccess;
     });
-    return cudaSuccess;
-  });
+  } else {
+    constexpr uint32_t RADIX_BITS = 4;
+    // call radix topk mask logits kernel
+    DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
+      const uint32_t smem_size =
+          sizeof(RadixTopKTempStorage<BLOCK_THREADS, REDUCE_ALGO, RADIX_BITS>);
+      dim3 nblks(batch_size);
+      dim3 nthrs(BLOCK_THREADS);
+      void* args[] = {&logits, &masked_logits, &top_k_arr, &top_k_val, &d};
+      DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+        auto kernel = RadixTopKMaskLogitsKernel<RADIX_BITS, BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE,
+                                                DType, IdType>;
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      });
+      return cudaSuccess;
+    });
+  }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,

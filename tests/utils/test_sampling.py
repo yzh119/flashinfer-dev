@@ -716,7 +716,7 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
 
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
-    test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))
+    # test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))
     # test_top_p_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     # test_top_k_sampling_freq(1, 128256, 10)
     # test_sampling(19, 500)
@@ -725,6 +725,6 @@ if __name__ == "__main__":
     # test_top_k_sampling(3, 111, 10)
     # test_top_p_renorm_probs(3, 111, 0.9)
     # test_top_k_renorm_probs(3, 111, 10)
-    # test_top_k_mask_logits(99, 989, 10)
+    test_top_k_mask_logits(99, 989, 10, False)
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
