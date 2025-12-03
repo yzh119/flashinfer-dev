@@ -84,10 +84,3 @@ from .dsv3_optimizations import (
 from .dsv3_optimizations import (
     gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
 )
-
-
-cuda_lib_path = os.environ.get(
-    "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
-)
-if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
-    ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
