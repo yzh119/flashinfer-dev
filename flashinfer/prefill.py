@@ -3426,7 +3426,9 @@ def trtllm_batch_context_with_kv_cache(
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
-) -> Union[torch.Tensor, FP4Tensor]:
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, FP4Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[FP4Tensor, torch.Tensor]]:
     """
     Parameters
     ----------
@@ -3478,11 +3480,17 @@ def trtllm_batch_context_with_kv_cache(
         Layout of kv-cache, can be "HND" or "NHD", default is "HND".
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
+    return_lse : bool = False
+        whether to return the logsumexp of attention scores. Defaults to False.
+    lse : Optional[torch.Tensor] = None
+        lse tensor, if not provided and return_lse is True, will be allocated with shape [query.shape[0], query.shape[1]]
 
     Returns
     -------
-    out: Union[torch.Tensor, FP4Tensor]
+    out: Union[torch.Tensor, FP4Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[FP4Tensor, torch.Tensor]]
         output torch.Tensor or FP4Tensor.
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
     """
 
     if enable_pdl is None:
@@ -3582,6 +3590,14 @@ def trtllm_batch_context_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
         bmm1_scale = bmm1_scale * log2e
@@ -3612,12 +3628,17 @@ def trtllm_batch_context_with_kv_cache(
         enable_pdl,
         workspace_size,
         sinks,
+        lse,
     )
-    return (
+    result = (
         out
         if out_dtype != "nvfp4"
         else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
     )
+    if return_lse:
+        return result, lse
+    else:
+        return result
 
 
 @flashinfer_api

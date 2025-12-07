@@ -528,7 +528,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool = None,
     backend: str = "auto",
-) -> torch.Tensor:
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
     ----------
@@ -572,6 +574,17 @@ def trtllm_batch_decode_with_kv_cache_mla(
         - (bmm1_scale_log2_tensor, bmm2_scale_tensor)
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
+    return_lse : bool = False
+        whether to return the logsumexp of attention scores. Defaults to False.
+    lse : Optional[torch.Tensor] = None
+        lse tensor, if not provided and return_lse is True, will be allocated with shape [query.shape[0], query.shape[2]]
+
+    Returns
+    -------
+    out : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor.
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
     """
     if backend == "auto":
         backend = (
@@ -597,7 +610,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 f"XQA MLA only supports q_len_per_request == 1, got {query.size(1)}"
             )
-        return xqa_batch_decode_with_kv_cache_mla(
+        if return_lse and lse is None:
+            lse = torch.empty(
+                query.shape[0],
+                query.shape[2],
+                device=query.device,
+                dtype=torch.float32,
+            )
+        result = xqa_batch_decode_with_kv_cache_mla(
             query,
             kv_cache,
             workspace_buffer,
@@ -612,7 +632,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
             bmm2_scale,
             sinks,
             enable_pdl,
+            return_lse=return_lse,
+            lse=lse,
         )
+        if return_lse:
+            return result
+        else:
+            return result
     elif backend == "trtllm-gen":
         enable_pdl = (
             device_support_pdl(query.device) if enable_pdl is None else enable_pdl
@@ -650,6 +676,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "out",
             )
 
+        if return_lse and lse is None:
+            lse = torch.empty(
+                query.shape[0],
+                query.shape[2],
+                device=query.device,
+                dtype=torch.float32,
+            )
+
         run_func(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -671,9 +705,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
+            lse,
         )
 
-        return out
+        if return_lse:
+            return out, lse
+        else:
+            return out
     else:
         raise ValueError(f"Backend {backend} not supported")
 
@@ -694,7 +732,9 @@ def xqa_batch_decode_with_kv_cache_mla(
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters:
     query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
@@ -725,6 +765,17 @@ def xqa_batch_decode_with_kv_cache_mla(
         - (bmm1_scale_log2_tensor, bmm2_scale_tensor)
         - Currently, only fp8 tensor core operation supports this mode.
     When both are provided, the dynamic scale factor tensors will be used.
+    return_lse : bool = False
+        whether to return the logsumexp of attention scores. Defaults to False.
+    lse : Optional[torch.Tensor] = None
+        lse tensor, if not provided and return_lse is True, will be allocated with shape [query.shape[0], query.shape[2]]
+
+    Returns
+    -------
+    out : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor.
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
     sm_count = get_device_sm_count(query.device)
@@ -766,6 +817,15 @@ def xqa_batch_decode_with_kv_cache_mla(
             "out",
         )
 
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[2],
+            device=query.device,
+            dtype=torch.float32,
+        )
+    lse_new = lse.unsqueeze(1) if lse is not None else None
+
     workspace_u8 = workspace_buffer.view(torch.uint8)
     semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore
     scratch = workspace_u8[8 * 1024 * 1024 :]
@@ -787,6 +847,10 @@ def xqa_batch_decode_with_kv_cache_mla(
         kv_scale=bmm2_scale,
         sm_count=sm_count,
         enable_pdl=enable_pdl,
+        lse=lse_new,
     )
 
-    return out
+    if return_lse:
+        return out, lse
+    else:
+        return out

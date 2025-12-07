@@ -2077,7 +2077,9 @@ def trtllm_batch_decode_with_kv_cache(
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
     mask: Optional[torch.Tensor] = None,
-) -> Union[torch.Tensor, FP4Tensor]:
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, FP4Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[FP4Tensor, torch.Tensor]]:
     """
     Parameters
     ----------
@@ -2149,11 +2151,17 @@ def trtllm_batch_decode_with_kv_cache(
 
     mask : Optional[torch.Tensor] = None
         causal attention mask for xqa speculative decoding.
+    return_lse : bool = False
+        whether to return the logsumexp of attention scores. Defaults to False.
+    lse : Optional[torch.Tensor] = None
+        lse tensor, if not provided and return_lse is True, will be allocated with shape [query.shape[0], query.shape[1]]
 
     Returns
     -------
-    out : Union[torch.Tensor, FP4Tensor]
+    out : Union[torch.Tensor, FP4Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[FP4Tensor, torch.Tensor]]
         output torch.Tensor or FP4Tensor.
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
@@ -2188,8 +2196,16 @@ def trtllm_batch_decode_with_kv_cache(
         if out is None:
             out = torch.empty_like(query, dtype=out_dtype)
 
+        if return_lse and lse is None:
+            lse = torch.empty(
+                query.shape[0],
+                query.shape[1],
+                device=query.device,
+                dtype=torch.float32,
+            )
+
         # Call xqa_batch_decode_with_kv_cache
-        return xqa_batch_decode_with_kv_cache(
+        result = xqa_batch_decode_with_kv_cache(
             query=query,
             kv_cache=(k_cache, v_cache),
             workspace_buffer=workspace_buffer,
@@ -2206,7 +2222,13 @@ def trtllm_batch_decode_with_kv_cache(
             q_len_per_req=q_len_per_req,
             o_scale=o_scale,
             mask=mask,
+            return_lse=return_lse,
+            lse=lse,
         )
+        if return_lse:
+            return result
+        else:
+            return result
     elif backend == "trtllm-gen":
         # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
         if kv_layout == "NHD":
@@ -2291,6 +2313,14 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+        if return_lse and lse is None:
+            lse = torch.empty(
+                query.shape[0],
+                query.shape[1],
+                device=query.device,
+                dtype=torch.float32,
+            )
+
         if isinstance(bmm1_scale, torch.Tensor):
             assert bmm1_scale.dtype == torch.float32
             bmm1_scale = bmm1_scale * log2e
@@ -2323,13 +2353,18 @@ def trtllm_batch_decode_with_kv_cache(
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
+            lse,
         )
 
-        return (
+        result = (
             out
             if out_dtype != "nvfp4"
             else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
         )
+        if return_lse:
+            return result, lse
+        else:
+            return result
     else:
         raise KeyError(f"Backend {backend} not supported")
 
@@ -2353,7 +2388,9 @@ def xqa_batch_decode_with_kv_cache(
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
     mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
     ----------
@@ -2406,11 +2443,17 @@ def xqa_batch_decode_with_kv_cache(
 
     mask : Optional[torch.Tensor] = None
         causal attention mask for xqa speculative decoding.
+    return_lse : bool = False
+        whether to return the logsumexp of attention scores. Defaults to False.
+    lse : Optional[torch.Tensor] = None
+        lse tensor, if not provided and return_lse is True, will be allocated with shape [query.shape[0], query.shape[1]]
 
     Returns
     -------
-    out : torch.Tensor
+    out : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         output torch.Tensor.
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
@@ -2459,6 +2502,15 @@ def xqa_batch_decode_with_kv_cache(
         out = torch.empty_like(query)
     out_4d = out.unsqueeze(1)
 
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+    lse_4d = lse.unsqueeze(1) if lse is not None else None
+
     xqa(
         query_new,
         k_cache,
@@ -2480,9 +2532,13 @@ def xqa_batch_decode_with_kv_cache(
         rcp_out_scale=1.0 / o_scale,
         q_seq_len=q_len_per_req,
         mask=mask,
+        lse=lse_4d,
     )
 
-    return out
+    if return_lse:
+        return out, lse
+    else:
+        return out
 
 
 def fast_decode_plan(
