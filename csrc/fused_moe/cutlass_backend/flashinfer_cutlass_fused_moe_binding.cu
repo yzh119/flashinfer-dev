@@ -246,6 +246,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
               int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
               Optional<Array<int64_t>> profile_ids, bool enable_pdl,
+              bool swizzled_input_sf,
               ActivationType base_activation_type = ActivationType::Swiglu) {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -378,7 +379,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
     // HACK Define default values for parameters we don't have good values for
-    bool const swizzled_input_sf = true;               // Assume input_sf is swizzled by default
     int64_t const unpadded_hidden_size = hidden_size;  // Assume no padding by default
     bool const use_lora = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
@@ -429,6 +429,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                          bool min_latency_mode, Optional<Array<int64_t>> profile_ids,
                          bool enable_pdl,
+                         bool swizzled_input_sf,
                          ActivationType base_activation_type = ActivationType::Swiglu) {
     std::lock_guard<std::mutex> lock(mMutex);
 
@@ -562,13 +563,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
     // HACK Define default values for parameters we don't have good values for
-    bool const swizzled_input_sf_ml = true;               // Assume input_sf is swizzled by default
     int64_t const unpadded_hidden_size_ml = hidden_size;  // Assume no padding by default
     bool const use_lora_ml = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-        swizzled_input_sf_ml, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        swizzled_input_sf, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
         token_final_scales.has_value()
             ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
             : nullptr,
@@ -585,7 +585,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-        swizzled_input_sf_ml, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        swizzled_input_sf, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
         token_final_scales.has_value()
             ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
             : nullptr,
@@ -726,12 +726,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
                  int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
-                 int64_t base_activation_type) {
+                 bool swizzled_input_sf, int64_t base_activation_type) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                    swiglu_alpha, swiglu_beta, swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
                    cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
-                   enable_pdl, static_cast<ActivationType>(base_activation_type));
+                   enable_pdl, swizzled_input_sf, static_cast<ActivationType>(base_activation_type));
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(
@@ -745,14 +745,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  TensorView active_expert_global_ids, int64_t tp_size, int64_t tp_rank,
                  int64_t ep_size, int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank,
                  bool enable_alltoall, bool min_latency_mode, Optional<Array<int64_t>> profile_ids,
-                 bool enable_pdl, int64_t base_activation_type) {
+                 bool enable_pdl, bool swizzled_input_sf, int64_t base_activation_type) {
             runMoeMinLantency(
                 output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                 fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                 swiglu_alpha, swiglu_beta, swiglu_limit, num_active_experts_per_node,
                 experts_to_token_score, active_expert_global_ids, tp_size, tp_rank, ep_size,
                 ep_rank, cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
-                enable_pdl, static_cast<ActivationType>(base_activation_type));
+                enable_pdl, swizzled_input_sf, static_cast<ActivationType>(base_activation_type));
           });
     } else {
       return Function(nullptr);

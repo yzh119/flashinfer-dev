@@ -516,6 +516,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        swizzled_input_sf: bool = True,
         activation_type: ActivationType = ActivationType.Swiglu,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
@@ -628,6 +629,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             min_latency_mode,
             [gemm_tactic_1, gemm_tactic_2],
             enable_pdl,
+            swizzled_input_sf,
             activation_type,
         )
 
@@ -671,6 +673,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        swizzled_input_sf: bool = True,
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -725,6 +728,7 @@ def cutlass_fused_moe(
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
+    swizzled_input_sf: bool = True,
     activation_type: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
@@ -830,6 +834,12 @@ def cutlass_fused_moe(
     tune_max_num_tokens : int = 8192
         Maximum number of tokens for tuning. Defaults to 8192.
 
+    swizzled_input_sf : bool = True
+        Whether the input scaling factor (input_sf) is swizzled. When True, the input_sf is expected
+        to be in swizzled format, which can improve performance when fusing the swizzle operation
+        into the MoE kernel. This is particularly useful when doing FP4 quantization with
+        allgather/alltoall communication. Defaults to True for backward compatibility.
+
     activation_type: ActivationType = ActivationType.Swiglu
         Activation to apply on for GEMM1, note that Relu2 means non-gated GEMM1
 
@@ -912,6 +922,7 @@ def cutlass_fused_moe(
         min_latency_mode=min_latency_mode,
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
+        swizzled_input_sf=swizzled_input_sf,
         activation_type=activation_type,
     )
 
