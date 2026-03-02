@@ -202,6 +202,12 @@ struct CollectiveEpilogue {
     write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
                               select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
                               qo_head_idx, qo_indptr, qo_len, write_warp_idx);
+    // Ensure all MMA threads finish reading smem_o before returning.
+    // Without this, a fast thread could signal barrier_O in the next mma_f16(),
+    // allowing the producer to overwrite smem_v (= smem_o, union) with V data
+    // for the next work item while other threads are still reading smem_o here.
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
+                                      cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
   }
 
   CUTLASS_DEVICE void store_tail() {
