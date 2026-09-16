@@ -192,6 +192,7 @@ AFFINE_SPLIT_MIN_CHUNKS = 256
 AFFINE_SPLIT_MIN_CHUNKS_PER_PART = 32
 AFFINE_SPLIT_MIN_PARTS = 8
 AFFINE_SPLIT_LOW_PART_MIN_CHUNKS = 2048
+BF16_AFFINE_SPLIT_MIN_CHUNKS = 128
 SMALL_BH_GROUP_SIZE = 8
 SMALL_BH_RING_STAGES = 35
 SMALL_BH_PACKET_ELEMS = HEAD_DIM
@@ -230,14 +231,17 @@ def _affine_split_part_count(*, sm_count: int, tasks: int, chunks: int, fp32_ind
     min_chunks = AFFINE_SPLIT_MIN_CHUNKS
     if fp32_indexed_state:
         min_chunks = max(min_chunks, tasks * AFFINE_SPLIT_MIN_CHUNKS_PER_PART)
+    if not shared_tf32_factors:
+        min_chunks = max(BF16_AFFINE_SPLIT_MIN_CHUNKS, tasks * 8)
     if shared_tf32_factors and unbounded_softplus:
         min_chunks = max(64, tasks * 8)
     if tasks <= 0 or tasks > AFFINE_SPLIT_MAX_TASKS or 2 * tasks > sm_count or (chunks < min_chunks):
         return 1
     parts = min(sm_count, max(2, sm_count // tasks), max(2, chunks // AFFINE_SPLIT_MIN_CHUNKS_PER_PART))
-    if shared_tf32_factors and unbounded_softplus:
+    if not shared_tf32_factors or unbounded_softplus:
         parts = min(sm_count, max(2, sm_count // tasks), max(2, chunks // 8))
-    if parts < AFFINE_SPLIT_MIN_PARTS and chunks < AFFINE_SPLIT_LOW_PART_MIN_CHUNKS:
+    min_parts = AFFINE_SPLIT_MIN_PARTS if shared_tf32_factors else 4
+    if parts < min_parts and chunks < AFFINE_SPLIT_LOW_PART_MIN_CHUNKS:
         return 1
     if shared_tf32_factors and (not unbounded_softplus):
         parts = min(sm_count, max(2, sm_count // tasks), max(2, chunks // 8))
@@ -252,7 +256,7 @@ def _affine_split_windows(*, sequence_lengths: tuple[int, ...], num_heads: int, 
     targets = [_affine_split_part_count(sm_count=sm_count, tasks=num_heads, chunks=chunks, fp32_indexed_state=fp32_indexed_state, shared_tf32_factors=shared_tf32_factors, unbounded_softplus=unbounded_softplus) for chunks in chunk_counts]
     window_budget = max(len(sequence_lengths), sm_count // num_heads)
     if len(sequence_lengths) > 1 and max(targets) > 1:
-        chunks_per_window = 8 if shared_tf32_factors else AFFINE_SPLIT_MIN_CHUNKS_PER_PART
+        chunks_per_window = 8
         targets = [max(target, min(window_budget, max(1, chunks // chunks_per_window))) for target, chunks in zip(targets, chunk_counts)]
     counts = targets.copy()
     if sum(targets) > window_budget:
@@ -889,18 +893,19 @@ def _should_use_h12_direct_n32(*, gpu_arch: str, num_heads: int, max_seq_len: in
     """Select the measured H12 range where two N16 chunks lose to one N32."""
     return gpu_arch in ('sm_100a', 'sm_103a') and num_heads == 12 and (H12_DIRECT_N32_MIN_SEQ_LEN <= max_seq_len <= H12_DIRECT_N32_MAX_SEQ_LEN)
 
-def _constrained_direct_m128_route(*, gpu_arch: str, num_heads: int, max_seq_len: int, force_direct_m128: bool, force_direct_m128_n32: bool, unbounded_softplus: bool, n16_short_four_stage: bool, state_dtype_is_fp32: bool, indexed_state_pool: bool, checkpoint_every_n_tokens: int) -> str:
+def _constrained_direct_m128_route(*, gpu_arch: str, num_heads: int, max_seq_len: int, force_direct_m128: bool, force_direct_m128_n32: bool, unbounded_softplus: bool, n16_short_four_stage: bool, state_dtype_is_fp32: bool, indexed_state_pool: bool, checkpoint_every_n_tokens: int, preferred_route: str) -> str:
     """Resolve direct-only serving requests without bypassing H12 N32 policy.
 
     Indexed state, checkpoint output, and independently strided beta all force
     the direct kernel family, but they do not require its N16 physical tile.
     Retain N16 for the qualified 64-token row and its private S4 experiment;
-    longer short residuals use the existing N32 checkpoint schedule.  This
-    also avoids carrying the N16 pipeline across eight or more chunks.
+    longer short residuals and dense grids retain the unconstrained N32
+    preference. Checkpoint and beta storage constraints select a legal family;
+    they must not reset its physical tile preference to N16.
     """
     if force_direct_m128_n32 or unbounded_softplus:
         return BF16_ROUTE_DIRECT_M128
-    if not n16_short_four_stage and (not force_direct_m128) and state_dtype_is_fp32 and indexed_state_pool and (checkpoint_every_n_tokens == 64) and (max_seq_len > 64) and _should_use_h12_direct_n32(gpu_arch=gpu_arch, num_heads=num_heads, max_seq_len=max_seq_len):
+    if not n16_short_four_stage and (not force_direct_m128) and state_dtype_is_fp32 and indexed_state_pool and (checkpoint_every_n_tokens in (0, 64)) and (max_seq_len > 64) and (checkpoint_every_n_tokens == 64 or max_seq_len >= 4 * BF16_M128_CHUNK) and (preferred_route == BF16_ROUTE_DIRECT_M128 or _should_use_h12_direct_n32(gpu_arch=gpu_arch, num_heads=num_heads, max_seq_len=max_seq_len)):
         return BF16_ROUTE_DIRECT_M128
     return _direct_m128_route(num_heads=num_heads, max_seq_len=max_seq_len)
 
@@ -1005,8 +1010,12 @@ class FlashKDABlackwellBF16FusedLaunch:
     _n16_short_four_stage = False
     _active_beta_f32 = False
 
-    def __init__(self, q, k, v, g, beta, scale: float, out, A_log, dt_bias, lower_bound: float | None, initial_state=None, final_state=None, cu_seqlens=None, state_indices=None, state_checkpoints=None, checkpoint_cu_starts=None, checkpoint_every_n_tokens: int=0, backend: str='cuda_cpp', compute_dtype: str='bf16', sequence_lengths: tuple[int, ...] | None=None, _affine_factor_cache=None, _affine_factor_cache_mode: int=0, _affine_map_only: bool=False, _affine_map_output: bool=False, _affine_cache_token_offset: int=0, _affine_cache_part_offset: int=0) -> None:
+    def __init__(self, q, k, v, g, beta, scale: float, out, A_log, dt_bias, lower_bound: float | None, initial_state=None, final_state=None, cu_seqlens=None, state_indices=None, state_checkpoints=None, checkpoint_cu_starts=None, checkpoint_every_n_tokens: int=0, backend: str='cuda_cpp', compute_dtype: str='bf16', sequence_lengths: tuple[int, ...] | None=None, _affine_factor_cache=None, _affine_factor_cache_mode: int=0, _affine_map_only: bool=False, _affine_map_output: bool=False, _affine_cache_token_offset: int=0, _affine_cache_part_offset: int=0, _affine_active_beta_f32: bool=False) -> None:
         import torch
+        if _affine_active_beta_f32:
+            if compute_dtype != 'tf32':
+                raise ValueError('active-beta affine windows require TF32 compute')
+            self._active_beta_f32 = True
         validate_kda_state_tensors(compute_dtype, initial_state, final_state)
         validate_kda_state_dtype(compute_dtype, state_dtype_is_fp32=self._state_dtype_is_fp32 and (not self._affine_main_indexed_initial_bf16))
         self.compute_dtype = compute_dtype
@@ -1119,7 +1128,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         elif _should_use_h12_active_beta_m64(gpu_arch=gpu_arch, sm_count=sm_count, num_heads=num_heads, max_seq_len=max_seq_len, total_tasks=total_tasks, active_beta_f32=self._active_beta_f32, state_dtype_is_fp32=self._state_dtype_is_fp32, indexed_state_pool=state_indices is not None, in_place_state_pool=initial_state is not None and initial_state is final_state, checkpoint_every_n_tokens=checkpoint_every_n_tokens, gate_kind=gate_kind, force_direct_m128=self._force_direct_m128, force_direct_m128_n32=self._force_direct_m128_n32, n16_short_four_stage=self._n16_short_four_stage):
             route = BF16_ROUTE_M64
         elif needs_direct_m128:
-            route = _constrained_direct_m128_route(gpu_arch=gpu_arch, num_heads=num_heads, max_seq_len=max_seq_len, force_direct_m128=self._force_direct_m128, force_direct_m128_n32=self._force_direct_m128_n32, unbounded_softplus=unbounded_softplus, n16_short_four_stage=self._n16_short_four_stage, state_dtype_is_fp32=self._state_dtype_is_fp32, indexed_state_pool=state_indices is not None, checkpoint_every_n_tokens=checkpoint_every_n_tokens)
+            route = _constrained_direct_m128_route(gpu_arch=gpu_arch, num_heads=num_heads, max_seq_len=max_seq_len, force_direct_m128=self._force_direct_m128, force_direct_m128_n32=self._force_direct_m128_n32, unbounded_softplus=unbounded_softplus, n16_short_four_stage=self._n16_short_four_stage, state_dtype_is_fp32=self._state_dtype_is_fp32, indexed_state_pool=state_indices is not None, checkpoint_every_n_tokens=checkpoint_every_n_tokens, preferred_route=_select_bf16_route(gpu_arch=gpu_arch, sm_count=sm_count, fixed_layout=fixed_layout, num_seqs=num_seqs, num_heads=num_heads, uniform_sequences=uniform_sequences, lpt_loads=lpt_loads, max_seq_len=max_seq_len, use_initial_state=initial_state is not None, store_final_state=final_state is not None) if compute_dtype == 'bf16' else BF16_ROUTE_DIRECT_M128_N16)
         else:
             route = _select_bf16_route(gpu_arch=gpu_arch, sm_count=sm_count, fixed_layout=fixed_layout, num_seqs=num_seqs, num_heads=num_heads, uniform_sequences=uniform_sequences, lpt_loads=lpt_loads, max_seq_len=max_seq_len, use_initial_state=initial_state is not None, store_final_state=final_state is not None)
         if route == BF16_ROUTE_BT16_M64 and (not self._state_dtype_is_fp32) and (state_indices is not None or has_nondefault_state_slot_stride):
@@ -1648,10 +1657,13 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
     route = BF16_ROUTE_AFFINE_SPLIT_M128
     schedule = 'split_seq_affine_prefix_direct_m128_fp32_state'
 
-    def __init__(self, q, k, v, g, beta, scale: float, out, A_log, dt_bias, lower_bound: float | None, initial_state=None, final_state=None, cu_seqlens=None, state_indices=None, state_checkpoints=None, checkpoint_cu_starts=None, checkpoint_every_n_tokens: int=0, backend: str='cuda_cpp', compute_dtype: str='bf16', sequence_lengths: tuple[int, ...] | None=None) -> None:
+    def __init__(self, q, k, v, g, beta, scale: float, out, A_log, dt_bias, lower_bound: float | None, initial_state=None, final_state=None, cu_seqlens=None, state_indices=None, state_checkpoints=None, checkpoint_cu_starts=None, checkpoint_every_n_tokens: int=0, backend: str='cuda_cpp', compute_dtype: str='bf16', sequence_lengths: tuple[int, ...] | None=None, active_beta_f32: bool=False) -> None:
         import torch
         validate_kda_state_tensors(compute_dtype, initial_state, final_state)
         self.compute_dtype = compute_dtype
+        self.active_beta_f32 = active_beta_f32
+        if active_beta_f32 and (compute_dtype != 'tf32' or lower_bound is None):
+            raise ValueError('active-beta affine requires bounded TF32 compute')
         if q.ndim != 4 or any((not tensor.is_contiguous() for tensor in (q, k, v, out))):
             raise ValueError('affine q/k/v/out require contiguous [B,T,H,128] tensors')
         if any((tensor.shape != q.shape for tensor in (k, v, out))):
@@ -1784,15 +1796,15 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             tail_factor_kwargs = dict(_affine_factor_cache=self._factor_cache, _affine_factor_cache_mode=2, _affine_cache_token_offset=first_part_tokens, _affine_cache_part_offset=1)
             self.schedule += '_shared_factors'
         main_launch_cls = FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch if self._external_state_is_fp32 else FlashKDABlackwellFP32SlabM128PDLIndexedBF16InitialProducerLaunch
-        self._main = main_launch_cls(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, self._main_initial, self._main_final, split_cu_seqlens, backend=backend, compute_dtype=compute_dtype, **main_checkpoint_kwargs, **main_factor_kwargs, sequence_lengths=tuple((b - a for a, b in zip(token_offsets[0:], token_offsets[1:]))))
+        self._main = main_launch_cls(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, self._main_initial, self._main_final, split_cu_seqlens, backend=backend, compute_dtype=compute_dtype, _affine_active_beta_f32=active_beta_f32, **main_checkpoint_kwargs, **main_factor_kwargs, sequence_lengths=tuple((b - a for a, b in zip(token_offsets[0:], token_offsets[1:]))))
         self._main.args.update(state_indices_addr=self._part_state_indices.data_ptr(), state_slot_stride=initial_state.stride(0), use_state_indices=1)
         if self._external_state_is_fp32:
             self._main.args['initial_state_f32'] = self._initial_pool_pointer
         else:
             self._main.args['initial_state'] = self._initial_pool_pointer
-        self._correction = None if self._use_output_projection else FlashKDABlackwellFP32SlabM128PDLConsumerLaunch(q[:, first_part_tokens:], k[:, first_part_tokens:], self._zero_v, g[:, first_part_tokens:], beta[:, first_part_tokens:], scale, self._correction_out, A_log, dt_bias, lower_bound, self._carry, self._correction_final, tail_cu_seqlens, backend=backend, compute_dtype=compute_dtype, **correction_checkpoint_kwargs, **tail_factor_kwargs, sequence_lengths=tuple((b - a for a, b in zip(token_offsets[1:], token_offsets[2:]))))
+        self._correction = None if self._use_output_projection else FlashKDABlackwellFP32SlabM128PDLConsumerLaunch(q[:, first_part_tokens:], k[:, first_part_tokens:], self._zero_v, g[:, first_part_tokens:], beta[:, first_part_tokens:], scale, self._correction_out, A_log, dt_bias, lower_bound, self._carry, self._correction_final, tail_cu_seqlens, backend=backend, compute_dtype=compute_dtype, _affine_active_beta_f32=active_beta_f32, **correction_checkpoint_kwargs, **tail_factor_kwargs, sequence_lengths=tuple((b - a for a, b in zip(token_offsets[1:], token_offsets[2:]))))
         map_launch_cls = FlashKDABlackwellFP32SlabM128PDLProducerLaunch if compute_dtype == 'tf32' else FlashKDABlackwellBF16DirectM128PDLBridgeLaunch
-        self._map = map_launch_cls(q[:, first_part_tokens:], k[:, first_part_tokens:], self._zero_v, g[:, first_part_tokens:], beta[:, first_part_tokens:], scale, self._map_out, A_log, dt_bias, lower_bound, self._map_initial, self._map_state, tail_cu_seqlens, backend=backend, compute_dtype=compute_dtype, _affine_map_only=compute_dtype == 'tf32', _affine_map_output=self._use_output_projection, **tail_factor_kwargs, sequence_lengths=tuple((b - a for a, b in zip(token_offsets[1:], token_offsets[2:]))))
+        self._map = map_launch_cls(q[:, first_part_tokens:], k[:, first_part_tokens:], self._zero_v, g[:, first_part_tokens:], beta[:, first_part_tokens:], scale, self._map_out, A_log, dt_bias, lower_bound, self._map_initial, self._map_state, tail_cu_seqlens, backend=backend, compute_dtype=compute_dtype, _affine_active_beta_f32=active_beta_f32, _affine_map_only=compute_dtype == 'tf32', _affine_map_output=self._use_output_projection, **tail_factor_kwargs, sequence_lengths=tuple((b - a for a, b in zip(token_offsets[1:], token_offsets[2:]))))
         if compute_dtype == 'bf16':
             self._map.args['initial_state_f32'] = self._main_final
         from flashinfer.jit.cake_kda_tf32 import compiled_flashkda_split_scan_bf16_m128
@@ -1963,24 +1975,17 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
     checkpoint_cu_starts = argument(15, 'checkpoint_cu_starts')
     checkpoint_every_n_tokens = int(argument(16, 'checkpoint_every_n_tokens', 0))
     compute_dtype = argument(18, 'compute_dtype', 'bf16')
-    if compute_dtype == 'tf32':
-        if q is None or beta is None or initial_state is None or (final_state is None) or (state_indices is None):
-            return False
-        if any((tensor is None or not tensor.is_contiguous() for tensor in (q, argument(1, 'k'), argument(2, 'v'), argument(6, 'out')))):
-            return False
-        checkpoint_request = state_checkpoints is not None or checkpoint_cu_starts is not None or checkpoint_every_n_tokens != 0
-        if checkpoint_request and (state_checkpoints is None or checkpoint_cu_starts is None or checkpoint_every_n_tokens != 64):
-            return False
-        lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, 'sequence_lengths'))
-        if not lengths or min(lengths) <= 0:
-            return False
-        return detect_gpu_arch() in ('sm_100a', 'sm_103a') and _affine_split_part_count(sm_count=_device_sm_count(q.device), tasks=len(lengths) * int(q.shape[2]), chunks=(max(lengths) + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK, fp32_indexed_state=True, shared_tf32_factors=True, unbounded_softplus=argument(9, 'lower_bound') is None) >= 2
-    if q is None or beta is None or initial_state is None or (final_state is None) or (state_indices is None) or (cu_seqlens is not None) or (state_checkpoints is not None) or (checkpoint_cu_starts is not None) or (checkpoint_every_n_tokens != 0) or (not beta.is_contiguous()) or (int(q.shape[0]) != 1):
+    if q is None or beta is None or initial_state is None or (final_state is None) or (state_indices is None):
         return False
-    tokens = int(q.shape[1])
-    tasks = int(q.shape[0]) * int(q.shape[2])
-    chunks = (tokens + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK
-    return detect_gpu_arch() in ('sm_100a', 'sm_103a') and _affine_split_part_count(sm_count=_device_sm_count(q.device), tasks=tasks, chunks=chunks, fp32_indexed_state=initial_state.dtype == torch.float32) >= 2 and (tokens % BF16_M128_CHUNK == 0)
+    if any((tensor is None or not tensor.is_contiguous() for tensor in (q, argument(1, 'k'), argument(2, 'v'), argument(6, 'out')))):
+        return False
+    checkpoint_request = state_checkpoints is not None or checkpoint_cu_starts is not None or checkpoint_every_n_tokens != 0
+    if checkpoint_request and (state_checkpoints is None or checkpoint_cu_starts is None or checkpoint_every_n_tokens != 64):
+        return False
+    lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, 'sequence_lengths'))
+    if not lengths or min(lengths) <= 0:
+        return False
+    return detect_gpu_arch() in ('sm_100a', 'sm_103a') and _affine_split_part_count(sm_count=_device_sm_count(q.device), tasks=len(lengths) * int(q.shape[2]), chunks=(max(lengths) + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK, fp32_indexed_state=initial_state.dtype == torch.float32, shared_tf32_factors=compute_dtype == 'tf32', unbounded_softplus=argument(9, 'lower_bound') is None) >= 2
 
 class FlashKDABlackwellLaunch:
     """Dispatch shared BF16/FP32 schedules and retain FP32 compatibility."""
@@ -2030,9 +2035,21 @@ def prepare_fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initi
         raise ValueError('FlashKDA requires use_qk_l2norm_in_kernel=True')
     return FlashKDABlackwellLaunch(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state, final_state, cu_seqlens, state_indices, state_checkpoints, checkpoint_cu_starts, checkpoint_every_n_tokens, compute_dtype=compute_dtype)
 
+def _should_use_bf16_active_beta_m64(*, sm_count, num_seqs, num_heads, max_seq_len):
+    """Split value ownership on sparse serving grids below affine crossover."""
+    return 512 <= max_seq_len and (max_seq_len + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK < BF16_AFFINE_SPLIT_MIN_CHUNKS and (0 < 8 * num_seqs * num_heads <= sm_count)
+
 def prepare_active_beta_fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state, final_state, cu_seqlens, state_indices, state_checkpoints, checkpoint_cu_starts, checkpoint_every_n_tokens: int=64, use_qk_l2norm_in_kernel: bool=True, sequence_lengths: tuple[int, ...] | None=None, compute_dtype: str='bf16') -> FlashKDABlackwellBF16FusedLaunch:
-    """Prepare active FP32 beta: BF16 direct policy or the TF32 BT16 family."""
+    """Prepare active FP32 beta using the legal runtime schedule preference."""
     if use_qk_l2norm_in_kernel is not True:
         raise ValueError('FlashKDA requires use_qk_l2norm_in_kernel=True')
     launch_cls = FlashKDABlackwellFP32ActiveBetaBT16Launch if compute_dtype == 'tf32' else FlashKDABlackwellFP32ActiveBetaFusedM128Launch
-    return launch_cls(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens, state_indices=state_indices, state_checkpoints=state_checkpoints, checkpoint_cu_starts=checkpoint_cu_starts, checkpoint_every_n_tokens=checkpoint_every_n_tokens, sequence_lengths=sequence_lengths, compute_dtype=compute_dtype)
+    if compute_dtype == 'bf16':
+        lengths = _launch_sequence_lengths(q, cu_seqlens, sequence_lengths)
+        if lengths and _should_use_bf16_active_beta_m64(sm_count=_device_sm_count(q.device), num_seqs=len(lengths), num_heads=int(q.shape[2]), max_seq_len=max(lengths)):
+            launch_cls = FlashKDABlackwellFP32ActiveBetaM64Launch
+    args = (q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound)
+    kwargs = dict(initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens, state_indices=state_indices, state_checkpoints=state_checkpoints, checkpoint_cu_starts=checkpoint_cu_starts, checkpoint_every_n_tokens=checkpoint_every_n_tokens, sequence_lengths=sequence_lengths, compute_dtype=compute_dtype)
+    if compute_dtype == 'tf32' and lower_bound is not None and _supports_affine_split_launch(args, kwargs):
+        return FlashKDABlackwellAffineSplitLaunch(*args, active_beta_f32=True, **kwargs)
+    return launch_cls(*args, **kwargs)
