@@ -225,27 +225,31 @@ class _PersistentM128Roofline:
     direct_ns: float
     piece_ns: float
 
-def _affine_split_part_count(*, sm_count: int, tasks: int, chunks: int, fp32_indexed_state: bool=False, shared_tf32_factors: bool=False) -> int:
+def _affine_split_part_count(*, sm_count: int, tasks: int, chunks: int, fp32_indexed_state: bool=False, shared_tf32_factors: bool=False, unbounded_softplus: bool=False) -> int:
     """Resolve the runtime split scheduler without an exact-shape bucket."""
     min_chunks = AFFINE_SPLIT_MIN_CHUNKS
     if fp32_indexed_state:
         min_chunks = max(min_chunks, tasks * AFFINE_SPLIT_MIN_CHUNKS_PER_PART)
+    if shared_tf32_factors and unbounded_softplus:
+        min_chunks = max(64, tasks * 8)
     if tasks <= 0 or tasks > AFFINE_SPLIT_MAX_TASKS or 2 * tasks > sm_count or (chunks < min_chunks):
         return 1
     parts = min(sm_count, max(2, sm_count // tasks), max(2, chunks // AFFINE_SPLIT_MIN_CHUNKS_PER_PART))
+    if shared_tf32_factors and unbounded_softplus:
+        parts = min(sm_count, max(2, sm_count // tasks), max(2, chunks // 8))
     if parts < AFFINE_SPLIT_MIN_PARTS and chunks < AFFINE_SPLIT_LOW_PART_MIN_CHUNKS:
         return 1
-    if shared_tf32_factors:
+    if shared_tf32_factors and (not unbounded_softplus):
         parts = min(sm_count, max(2, sm_count // tasks), max(2, chunks // 8))
     return parts
 
-def _affine_split_windows(*, sequence_lengths: tuple[int, ...], num_heads: int, sm_count: int, fp32_indexed_state: bool, shared_tf32_factors: bool, checkpoints: bool):
+def _affine_split_windows(*, sequence_lengths: tuple[int, ...], num_heads: int, sm_count: int, fp32_indexed_state: bool, shared_tf32_factors: bool, checkpoints: bool, unbounded_softplus: bool=False):
     """Partition original sequences into runtime windows without crossing boundaries."""
     tasks = len(sequence_lengths) * num_heads
     if not sequence_lengths or min(sequence_lengths) <= 0 or tasks > AFFINE_SPLIT_MAX_TASKS:
         raise ValueError('affine requires nonempty sequences and at most32 sequence/head tasks')
     chunk_counts = [(length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in sequence_lengths]
-    targets = [_affine_split_part_count(sm_count=sm_count, tasks=num_heads, chunks=chunks, fp32_indexed_state=fp32_indexed_state, shared_tf32_factors=shared_tf32_factors) for chunks in chunk_counts]
+    targets = [_affine_split_part_count(sm_count=sm_count, tasks=num_heads, chunks=chunks, fp32_indexed_state=fp32_indexed_state, shared_tf32_factors=shared_tf32_factors, unbounded_softplus=unbounded_softplus) for chunks in chunk_counts]
     window_budget = max(len(sequence_lengths), sm_count // num_heads)
     if len(sequence_lengths) > 1 and max(targets) > 1:
         chunks_per_window = 8 if shared_tf32_factors else AFFINE_SPLIT_MIN_CHUNKS_PER_PART
@@ -1700,7 +1704,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 raise ValueError('affine checkpoint shape must be [C,H,128,128]')
             if checkpoint_cu_starts.shape != (num_sequences + 1,) or checkpoint_cu_starts.dtype != torch.int64:
                 raise ValueError('affine checkpoint offsets must be int64[N+1]')
-        token_offsets, part_offsets = _affine_split_windows(sequence_lengths=resolved_lengths, num_heads=heads, sm_count=_device_sm_count(q.device), fp32_indexed_state=initial_state.dtype == torch.float32, shared_tf32_factors=compute_dtype == 'tf32', checkpoints=state_checkpoints is not None)
+        token_offsets, part_offsets = _affine_split_windows(sequence_lengths=resolved_lengths, num_heads=heads, sm_count=_device_sm_count(q.device), fp32_indexed_state=initial_state.dtype == torch.float32, shared_tf32_factors=compute_dtype == 'tf32', checkpoints=state_checkpoints is not None, unbounded_softplus=lower_bound is None)
         num_parts = len(token_offsets) - 1
         self._num_sequences = num_sequences
         self.sequence_lengths = resolved_lengths
@@ -1959,7 +1963,7 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
     checkpoint_cu_starts = argument(15, 'checkpoint_cu_starts')
     checkpoint_every_n_tokens = int(argument(16, 'checkpoint_every_n_tokens', 0))
     compute_dtype = argument(18, 'compute_dtype', 'bf16')
-    if compute_dtype == 'tf32' and argument(9, 'lower_bound') is not None:
+    if compute_dtype == 'tf32':
         if q is None or beta is None or initial_state is None or (final_state is None) or (state_indices is None):
             return False
         if any((tensor is None or not tensor.is_contiguous() for tensor in (q, argument(1, 'k'), argument(2, 'v'), argument(6, 'out')))):
@@ -1970,7 +1974,7 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, 'sequence_lengths'))
         if not lengths or min(lengths) <= 0:
             return False
-        return detect_gpu_arch() in ('sm_100a', 'sm_103a') and _affine_split_part_count(sm_count=_device_sm_count(q.device), tasks=len(lengths) * int(q.shape[2]), chunks=(max(lengths) + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK, fp32_indexed_state=True, shared_tf32_factors=True) >= 2
+        return detect_gpu_arch() in ('sm_100a', 'sm_103a') and _affine_split_part_count(sm_count=_device_sm_count(q.device), tasks=len(lengths) * int(q.shape[2]), chunks=(max(lengths) + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK, fp32_indexed_state=True, shared_tf32_factors=True, unbounded_softplus=argument(9, 'lower_bound') is None) >= 2
     if q is None or beta is None or initial_state is None or (final_state is None) or (state_indices is None) or (cu_seqlens is not None) or (state_checkpoints is not None) or (checkpoint_cu_starts is not None) or (checkpoint_every_n_tokens != 0) or (not beta.is_contiguous()) or (int(q.shape[0]) != 1):
         return False
     tokens = int(q.shape[1])
