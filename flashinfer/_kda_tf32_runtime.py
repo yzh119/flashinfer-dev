@@ -4,6 +4,8 @@ Licensed under the Apache License, Version 2.0.
 https://www.apache.org/licenses/LICENSE-2.0
 """
 from __future__ import annotations
+from functools import partial
+from flashinfer.jit.cake_kda_tf32 import _factory
 'Canonical semantic and ABI compile axes shared by KDA schedules.'
 from enum import Enum
 
@@ -1019,7 +1021,6 @@ class FlashKDABlackwellBF16FusedLaunch:
         validate_kda_state_tensors(compute_dtype, initial_state, final_state)
         validate_kda_state_dtype(compute_dtype, state_dtype_is_fp32=self._state_dtype_is_fp32 and (not self._affine_main_indexed_initial_bf16))
         self.compute_dtype = compute_dtype
-        from flashinfer.jit.cake_kda_tf32 import compiled_bf16_fused_m128
         for name, tensor in (('q', q), ('k', k), ('v', v), ('out', out)):
             _require_tensor(tensor, name=name, dtype=torch.bfloat16, ndim=4)
         _require_tensor(g, name='g', dtype=torch.bfloat16, ndim=4, contiguous=False)
@@ -1333,40 +1334,27 @@ class FlashKDABlackwellBF16FusedLaunch:
         if backend != 'cuda_cpp' and (compute_dtype == 'tf32' or not (uses_default_fused_m128 or use_persistent_m128)):
             raise NotImplementedError(f'FlashKDA route {route!r} does not thread backend={backend!r} to its compiled module')
         if use_bt16_prepare_chain and compute_dtype == 'tf32':
-            from flashinfer.jit.cake_kda_tf32 import compiled_tf32_bt16_chain_m64_fp32_state
-            from flashinfer.jit.cake_kda_tf32 import compiled_tf32_bt16_prepare
-            from flashinfer.jit.cake_kda_tf32 import compiled_tf32_bt16_prepare_beta_tma
-            self.prepare_module = _build_kda_module(compiled_tf32_bt16_prepare_beta_tma) if use_bt16_beta_tma else _build_kda_module(compiled_tf32_bt16_prepare, active_beta_f32=self._active_beta_f32)
-            self.module = _build_kda_module(compiled_tf32_bt16_chain_m64_fp32_state, compact_output=use_bt16_s7_chain, split_prediction=use_bt16_s9_chain, serving_native_abi=serving_native_abi, write_checkpoints=bool(checkpoint_every_n_tokens))
+            self.prepare_module = _build_kda_module(partial(_factory, 'compiled_tf32_bt16_prepare_beta_tma')) if use_bt16_beta_tma else _build_kda_module(partial(_factory, 'compiled_tf32_bt16_prepare'), active_beta_f32=self._active_beta_f32)
+            self.module = _build_kda_module(partial(_factory, 'compiled_tf32_bt16_chain_m64_fp32_state'), compact_output=use_bt16_s7_chain, split_prediction=use_bt16_s9_chain, serving_native_abi=serving_native_abi, write_checkpoints=bool(checkpoint_every_n_tokens))
             self.schedule = 'bt16_tf32_m64_s6_fp32_compact_output' if use_bt16_s7_chain else 'bt16_tf32_m64_s6_fp32_split_prediction' if use_bt16_s9_chain else 'bt16_tf32_m64_s6_fp32'
         elif use_bt16_prepare_chain:
-            from flashinfer.jit.cake_kda_tf32 import compiled_bf16_bt16_chain_m64
-            from flashinfer.jit.cake_kda_tf32 import compiled_bf16_bt16_chain_m64_s7
-            from flashinfer.jit.cake_kda_tf32 import compiled_bf16_bt16_chain_m64_s9
-            from flashinfer.jit.cake_kda_tf32 import compiled_fp32_bt16_chain_m64
-            from flashinfer.jit.cake_kda_tf32 import compiled_bf16_bt16_prepare
-            from flashinfer.jit.cake_kda_tf32 import compiled_bf16_bt16_prepare_beta_tma
-            self.prepare_module = _build_kda_module(compiled_bf16_bt16_prepare_beta_tma) if use_bt16_beta_tma else _build_kda_module(compiled_bf16_bt16_prepare, active_beta_f32=self._active_beta_f32)
-            self.module = _build_kda_module(compiled_fp32_bt16_chain_m64, stage_count=7 if use_bt16_s7_chain else 9 if use_bt16_s9_chain else 8, serving_native_abi=serving_native_abi, write_checkpoints=bool(checkpoint_every_n_tokens)) if self._state_dtype_is_fp32 else _build_kda_module(compiled_bf16_bt16_chain_m64_s7, write_checkpoints=bool(checkpoint_every_n_tokens)) if use_bt16_s7_chain else _build_kda_module(compiled_bf16_bt16_chain_m64_s9, write_checkpoints=bool(checkpoint_every_n_tokens)) if use_bt16_s9_chain else _build_kda_module(compiled_bf16_bt16_chain_m64, write_checkpoints=bool(checkpoint_every_n_tokens))
+            self.prepare_module = _build_kda_module(partial(_factory, 'compiled_bf16_bt16_prepare_beta_tma')) if use_bt16_beta_tma else _build_kda_module(partial(_factory, 'compiled_bf16_bt16_prepare'), active_beta_f32=self._active_beta_f32)
+            self.module = _build_kda_module(partial(_factory, 'compiled_fp32_bt16_chain_m64'), stage_count=7 if use_bt16_s7_chain else 9 if use_bt16_s9_chain else 8, serving_native_abi=serving_native_abi, write_checkpoints=bool(checkpoint_every_n_tokens)) if self._state_dtype_is_fp32 else _build_kda_module(partial(_factory, 'compiled_bf16_bt16_chain_m64_s7'), write_checkpoints=bool(checkpoint_every_n_tokens)) if use_bt16_s7_chain else _build_kda_module(partial(_factory, 'compiled_bf16_bt16_chain_m64_s9'), write_checkpoints=bool(checkpoint_every_n_tokens)) if use_bt16_s9_chain else _build_kda_module(partial(_factory, 'compiled_bf16_bt16_chain_m64'), write_checkpoints=bool(checkpoint_every_n_tokens))
             self.schedule = 'decomposed_bt16_prepare_chain_m64_fp32_state_s7_two_resident' if self._state_dtype_is_fp32 and use_bt16_s7_chain else 'decomposed_bt16_prepare_chain_m64_fp32_state_s9_underfilled' if self._state_dtype_is_fp32 and use_bt16_s9_chain else 'decomposed_bt16_prepare_chain_m64_fp32_state' if self._state_dtype_is_fp32 else 'decomposed_bt16_prepare_chain_m64_wavefront_s7_two_resident' if use_bt16_s7_chain else 'decomposed_bt16_prepare_chain_m64_wavefront_s9_underfilled' if use_bt16_s9_chain else 'decomposed_bt16_prepare_chain_m64_wavefront'
         elif not (use_tf32_direct_m128 or use_tf32_owner_helper) and (not (use_independent_dvsplit and (self._active_beta_f32 or compute_dtype == 'tf32'))):
-            self.module = _build_kda_module(compiled_bf16_fused_m128, BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK, serving_native_abi=serving_native_abi, gate_kind=gate_kind, checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16), pair_packed_beta=use_pair_packed_beta, scalar_beta=use_scalar_beta, active_beta_f32=self._active_beta_f32, logical_page64=use_n32_logical_page64, early_n32_state_pack=use_early_n32_state_pack, generic_register_inverse=use_n32_register_inverse, n32_prediction_first=use_n32_prediction_first, tensor_state_decay=use_n32_tensor_state_decay, state_dtype_is_fp32=self._state_dtype_is_fp32, n32_ft_slab=self._n32_ft_slab and (not use_direct_m128_n16), pdl_wait_initial_state_f32=self._pdl_wait_initial_state_f32, pdl_publish_final_state=self._pdl_publish_final_state, affine_main_indexed_initial=self._affine_main_indexed_initial, affine_main_indexed_initial_bf16=self._affine_main_indexed_initial_bf16, backend=backend, n16_short_four_stage=self._n16_short_four_stage)
+            self.module = _build_kda_module(partial(_factory, 'compiled_bf16_fused_m128'), BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK, serving_native_abi=serving_native_abi, gate_kind=gate_kind, checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16), pair_packed_beta=use_pair_packed_beta, scalar_beta=use_scalar_beta, active_beta_f32=self._active_beta_f32, logical_page64=use_n32_logical_page64, early_n32_state_pack=use_early_n32_state_pack, generic_register_inverse=use_n32_register_inverse, n32_prediction_first=use_n32_prediction_first, tensor_state_decay=use_n32_tensor_state_decay, state_dtype_is_fp32=self._state_dtype_is_fp32, n32_ft_slab=self._n32_ft_slab and (not use_direct_m128_n16), pdl_wait_initial_state_f32=self._pdl_wait_initial_state_f32, pdl_publish_final_state=self._pdl_publish_final_state, affine_main_indexed_initial=self._affine_main_indexed_initial, affine_main_indexed_initial_bf16=self._affine_main_indexed_initial_bf16, backend=backend, n16_short_four_stage=self._n16_short_four_stage)
             self.schedule = ('fused_checkpoint_tma_direct_m128_n16_s4' if self._n16_short_four_stage else 'fused_checkpoint_tma_direct_m128_n16' if checkpoint_every_n_tokens else 'fused_h12_direct_m128_n16' if num_heads == 12 else 'fused_direct_m128_n16') if use_direct_m128_n16 else 'fused_checkpoint_direct_m128_page64_n32x2' if use_n32_logical_page64 and checkpoint_every_n_tokens else 'fused_h12_direct_m128_page64_n32x2' if use_n32_logical_page64 else 'fused_unbounded_softplus_direct_m128' if unbounded_softplus else 'fused_checkpoint_direct_m128_n32' if checkpoint_every_n_tokens else 'fused_prediction_first_direct_m128' if use_n32_prediction_first and (not use_n32_tensor_state_decay) else 'fused_tensor_state_decay_direct_m128' if use_n32_tensor_state_decay else 'fused_mr526_direct_m128'
         if use_tf32_owner_helper:
-            from flashinfer.jit.cake_kda_tf32 import compiled_tf32_fused_n32
             n32_value_rows = 64 if 2 * SMALL_BH_GROUP_SIZE * total_tasks <= sm_count else 128
-            self.module = _build_kda_module(compiled_tf32_fused_n32, owner_helpers=7, unbounded_softplus=unbounded_softplus, value_rows=n32_value_rows, prep_stages=3, active_beta_f32=self._active_beta_f32, state_dtype_is_fp32=True, round_tf32_operands=False, write_checkpoints=bool(checkpoint_every_n_tokens))
+            self.module = _build_kda_module(partial(_factory, 'compiled_tf32_fused_n32'), owner_helpers=7, unbounded_softplus=unbounded_softplus, value_rows=n32_value_rows, prep_stages=3, active_beta_f32=self._active_beta_f32, state_dtype_is_fp32=True, round_tf32_operands=False, write_checkpoints=bool(checkpoint_every_n_tokens))
             self.schedule = f'fused_tf32_small_bh_m{n32_value_rows}_owner7helper_ring21'
             if unbounded_softplus:
                 self.schedule += '_unbounded_softplus'
         elif use_small_bh_owner_helper:
-            from flashinfer.jit.cake_kda_tf32 import compiled_small_bh_m128
-            self.module = _build_kda_module(compiled_small_bh_m128, state_dtype_is_fp32=self._state_dtype_is_fp32, serving_native_abi=serving_native_abi)
+            self.module = _build_kda_module(partial(_factory, 'compiled_small_bh_m128'), state_dtype_is_fp32=self._state_dtype_is_fp32, serving_native_abi=serving_native_abi)
             self.schedule = 'fused_small_bh_m128_owner7helper_fp32_state_ring35' if self._state_dtype_is_fp32 else 'fused_small_bh_m128_owner7helper_compact_ring35'
         elif (use_independent_dvsplit or use_tf32_direct_m128) and compute_dtype == 'tf32':
-            from flashinfer.jit.cake_kda_tf32 import compiled_tf32_fused
             if use_tf32_direct_n32:
-                from flashinfer.jit.cake_kda_tf32 import compiled_tf32_fused_n32
                 direct_operands = not (self._pdl_wait_initial_state_f32 or self._pdl_publish_final_state or self._affine_main_indexed_initial)
                 compact_state = gpu_arch == 'sm_103a' and direct_operands and (num_seqs * num_heads > sm_count) and (max_seq_len <= 256)
                 if compact_state and (not checkpoint_every_n_tokens) and (128 < max_seq_len <= 256) and ((min(resolved_sequence_lengths) + 31) // 32 == (max_seq_len + 31) // 32) and (5 * sm_count <= 2 * total_tasks) and (total_tasks <= 3 * sm_count):
@@ -1375,7 +1363,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if gpu_arch == 'sm_103a' and direct_operands and (2 * total_tasks <= sm_count) and (32 <= max_seq_len):
                     n32_value_rows = 64
                 n32_checkpoint_tma = bool(compact_state and checkpoint_every_n_tokens and (state_checkpoints is not None) and (state_checkpoints.data_ptr() % 16 == 0))
-                self.module = _build_kda_module(compiled_tf32_fused_n32, state_dtype_is_fp32=self._state_dtype_is_fp32, active_beta_f32=self._active_beta_f32, unbounded_softplus=unbounded_softplus, write_checkpoints=bool(checkpoint_every_n_tokens), prep_stages=n32_prepare_stages, round_tf32_operands=not direct_operands, compact_state=compact_state, value_rows=n32_value_rows, checkpoint_tma=n32_checkpoint_tma, pdl_wait_initial_state_f32=self._pdl_wait_initial_state_f32, pdl_publish_final_state=self._pdl_publish_final_state, affine_main_indexed_initial=self._affine_main_indexed_initial, affine_main_indexed_initial_bf16=self._affine_main_indexed_initial_bf16, affine_factor_cache=_affine_factor_cache_mode, affine_map_only=_affine_map_only, affine_map_output=_affine_map_output)
+                self.module = _build_kda_module(partial(_factory, 'compiled_tf32_fused_n32'), state_dtype_is_fp32=self._state_dtype_is_fp32, active_beta_f32=self._active_beta_f32, unbounded_softplus=unbounded_softplus, write_checkpoints=bool(checkpoint_every_n_tokens), prep_stages=n32_prepare_stages, round_tf32_operands=not direct_operands, compact_state=compact_state, value_rows=n32_value_rows, checkpoint_tma=n32_checkpoint_tma, pdl_wait_initial_state_f32=self._pdl_wait_initial_state_f32, pdl_publish_final_state=self._pdl_publish_final_state, affine_main_indexed_initial=self._affine_main_indexed_initial, affine_main_indexed_initial_bf16=self._affine_main_indexed_initial_bf16, affine_factor_cache=_affine_factor_cache_mode, affine_map_only=_affine_map_only, affine_map_output=_affine_map_output)
                 self.schedule = f'fused_tf32_m{n32_value_rows}_local_factors_s{n32_prepare_stages}_n32'
                 if unbounded_softplus:
                     self.schedule += '_unbounded_softplus'
@@ -1388,27 +1376,22 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if self._pdl_wait_initial_state_f32 or self._pdl_publish_final_state:
                     self.schedule += '_pdl'
             else:
-                self.module = _build_kda_module(compiled_tf32_fused, value_rows=128 if use_tf32_direct_m128 else 64, state_dtype_is_fp32=self._state_dtype_is_fp32, active_beta_f32=self._active_beta_f32, write_checkpoints=bool(checkpoint_every_n_tokens), prep_stages=4 if self._n16_short_four_stage else 3)
+                self.module = _build_kda_module(partial(_factory, 'compiled_tf32_fused'), value_rows=128 if use_tf32_direct_m128 else 64, state_dtype_is_fp32=self._state_dtype_is_fp32, active_beta_f32=self._active_beta_f32, write_checkpoints=bool(checkpoint_every_n_tokens), prep_stages=4 if self._n16_short_four_stage else 3)
                 self.schedule = 'fused_tf32_m128_local_factors_s4_n16' if self._n16_short_four_stage else 'fused_tf32_m128_local_factors_s3_n16' if use_tf32_direct_m128 else 'fused_tf32_m64_local_factors_s3'
         elif use_independent_dvsplit:
-            from flashinfer.jit.cake_kda_tf32 import compiled_bf16_fused_m64
-            self.module = _build_kda_module(compiled_bf16_fused_m64, state_dtype_is_fp32=self._state_dtype_is_fp32, active_beta_f32=self._active_beta_f32)
+            self.module = _build_kda_module(partial(_factory, 'compiled_bf16_fused_m64'), state_dtype_is_fp32=self._state_dtype_is_fp32, active_beta_f32=self._active_beta_f32)
             self.schedule = 'fused_active_beta_checkpoint_dvsplit_m64' if self._active_beta_f32 else 'fused_source599_m64_independent_dvsplit_fp32_state' if self._state_dtype_is_fp32 else 'fused_source599_m64_independent_dvsplit'
         elif use_source_vtile_m128:
-            from flashinfer.jit.cake_kda_tf32 import compiled_bf16_fused_m128_vtile
-            self.module = _build_kda_module(compiled_bf16_fused_m128_vtile, full_chunks=full_n32_chunks, num_heads=num_heads, use_initial_state=initial_state is not None, store_final_state=final_state is not None, scale=float(scale), lower_bound=float(lower_bound), persistent_mode=source_vtile_persistent_tasks > 1, persistent_six_task_schedule=source_vtile_persistent_tasks == 6, persistent_stride_head_aligned=source_vtile_worker_count % num_heads == 0, state_dtype_is_fp32=self._state_dtype_is_fp32)
+            self.module = _build_kda_module(partial(_factory, 'compiled_bf16_fused_m128_vtile'), full_chunks=full_n32_chunks, num_heads=num_heads, use_initial_state=initial_state is not None, store_final_state=final_state is not None, scale=float(scale), lower_bound=float(lower_bound), persistent_mode=source_vtile_persistent_tasks > 1, persistent_six_task_schedule=source_vtile_persistent_tasks == 6, persistent_stride_head_aligned=source_vtile_worker_count % num_heads == 0, state_dtype_is_fp32=self._state_dtype_is_fp32)
             self.schedule = 'fused_source599_vtile_m128_persistent_fp32_state' if self._state_dtype_is_fp32 and source_vtile_persistent_tasks > 1 else 'fused_source599_vtile_m128_persistent' if source_vtile_persistent_tasks > 1 else 'fused_source599_vtile_m128_fp32_state' if self._state_dtype_is_fp32 else 'fused_source599_vtile_m128'
         elif use_scalar_chunk_lpt_m128:
-            from flashinfer.jit.cake_kda_tf32 import compiled_bf16_fused_m128 as compiled_scalar_chunk_lpt_m128
-            self.module = _build_kda_module(compiled_scalar_chunk_lpt_m128, num_heads=num_heads, use_initial_state=initial_state is not None, store_final_state=final_state is not None, scale=float(scale), lower_bound=float(lower_bound), persistent_schedule=True, state_dtype_is_fp32=self._state_dtype_is_fp32)
+            self.module = _build_kda_module(partial(_factory, 'compiled_scalar_chunk_lpt_m128'), num_heads=num_heads, use_initial_state=initial_state is not None, store_final_state=final_state is not None, scale=float(scale), lower_bound=float(lower_bound), persistent_schedule=True, state_dtype_is_fp32=self._state_dtype_is_fp32)
             self.schedule = 'fused_source599_scalar_chunk_lpt_m128_fp32_state' if self._state_dtype_is_fp32 else 'fused_source599_scalar_chunk_lpt_m128'
         elif use_persistent_m128:
-            from flashinfer.jit.cake_kda_tf32 import compiled_bf16_persistent_m128
             if use_tf32_persistent_m128:
-                from flashinfer.jit.cake_kda_tf32 import compiled_tf32_fused_n32
-                self.module = _build_kda_module(compiled_tf32_fused_n32, state_dtype_is_fp32=self._state_dtype_is_fp32, write_checkpoints=bool(checkpoint_every_n_tokens), prep_stages=1 if max_seq_len <= 64 else 3, persistent_tasks=True, piece_tasks=use_piece_persistent_m128)
+                self.module = _build_kda_module(partial(_factory, 'compiled_tf32_fused_n32'), state_dtype_is_fp32=self._state_dtype_is_fp32, write_checkpoints=bool(checkpoint_every_n_tokens), prep_stages=1 if max_seq_len <= 64 else 3, persistent_tasks=True, piece_tasks=use_piece_persistent_m128)
             else:
-                self.module = _build_kda_module(compiled_bf16_persistent_m128, piece_tasks=use_piece_persistent_m128, state_dtype_is_fp32=self._state_dtype_is_fp32, write_checkpoints=bool(checkpoint_every_n_tokens), backend=backend)
+                self.module = _build_kda_module(partial(_factory, 'compiled_bf16_persistent_m128'), piece_tasks=use_piece_persistent_m128, state_dtype_is_fp32=self._state_dtype_is_fp32, write_checkpoints=bool(checkpoint_every_n_tokens), backend=backend)
             self.schedule = 'fused_mr527_persistent_m128_head_grouped_fp32_state' if self._state_dtype_is_fp32 and use_head_grouped_m128 else 'fused_mr527_persistent_m128_lpt_bins_fp32_state' if self._state_dtype_is_fp32 and use_lpt_persistent_m128 else 'fused_mr527_persistent_m128_recurrence_pieces_fp32_state' if self._state_dtype_is_fp32 and use_piece_persistent_m128 else 'fused_mr527_persistent_m128_head_grouped' if use_head_grouped_m128 else 'fused_mr527_persistent_m128_lpt_bins' if use_lpt_persistent_m128 else 'fused_mr527_persistent_m128_recurrence_pieces'
         self.route = route
         self.gate_kind = gate_kind.value
@@ -1802,18 +1785,18 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._main.args['initial_state_f32'] = self._initial_pool_pointer
         else:
             self._main.args['initial_state'] = self._initial_pool_pointer
-        self._correction = None if self._use_output_projection else FlashKDABlackwellFP32SlabM128PDLConsumerLaunch(q[:, first_part_tokens:], k[:, first_part_tokens:], self._zero_v, g[:, first_part_tokens:], beta[:, first_part_tokens:], scale, self._correction_out, A_log, dt_bias, lower_bound, self._carry, self._correction_final, tail_cu_seqlens, backend=backend, compute_dtype=compute_dtype, _affine_active_beta_f32=active_beta_f32, **correction_checkpoint_kwargs, **tail_factor_kwargs, sequence_lengths=tuple((b - a for a, b in zip(token_offsets[1:], token_offsets[2:]))))
+        self._correction = None
+        if not self._use_output_projection:
+            self._correction = FlashKDABlackwellFP32SlabM128PDLConsumerLaunch(q[:, first_part_tokens:], k[:, first_part_tokens:], self._zero_v, g[:, first_part_tokens:], beta[:, first_part_tokens:], scale, self._correction_out, A_log, dt_bias, lower_bound, self._carry, self._correction_final, tail_cu_seqlens, backend=backend, compute_dtype=compute_dtype, _affine_active_beta_f32=active_beta_f32, **correction_checkpoint_kwargs, **tail_factor_kwargs, sequence_lengths=tuple((b - a for a, b in zip(token_offsets[1:], token_offsets[2:]))))
         map_launch_cls = FlashKDABlackwellFP32SlabM128PDLProducerLaunch if compute_dtype == 'tf32' else FlashKDABlackwellBF16DirectM128PDLBridgeLaunch
         self._map = map_launch_cls(q[:, first_part_tokens:], k[:, first_part_tokens:], self._zero_v, g[:, first_part_tokens:], beta[:, first_part_tokens:], scale, self._map_out, A_log, dt_bias, lower_bound, self._map_initial, self._map_state, tail_cu_seqlens, backend=backend, compute_dtype=compute_dtype, _affine_active_beta_f32=active_beta_f32, _affine_map_only=compute_dtype == 'tf32', _affine_map_output=self._use_output_projection, **tail_factor_kwargs, sequence_lengths=tuple((b - a for a, b in zip(token_offsets[1:], token_offsets[2:]))))
         if compute_dtype == 'bf16':
             self._map.args['initial_state_f32'] = self._main_final
-        from flashinfer.jit.cake_kda_tf32 import compiled_flashkda_split_scan_bf16_m128
-        self._scan_module = _build_kda_module(compiled_flashkda_split_scan_bf16_m128, use_pdl=True, compute_dtype=compute_dtype, backend=backend)
+        self._scan_module = _build_kda_module(partial(_factory, 'compiled_flashkda_split_scan_bf16_m128'), use_pdl=True, compute_dtype=compute_dtype, backend=backend)
         self._out_tail = out[:, first_part_tokens:]
         self._projection_module = None
         if self._use_output_projection:
-            from flashinfer.jit.cake_kda_tf32 import compiled_affine_output_projection
-            self._projection_module = _build_kda_module(compiled_affine_output_projection)
+            self._projection_module = _build_kda_module(partial(_factory, 'compiled_affine_output_projection'))
             self._map_coefficients = torch.empty_like(self._correction_out, dtype=torch.float32)
             self._map.args['map_output_f32'] = self._map_coefficients
             chunks = [(start, min(128, end - start), part) for part, (begin, end) in enumerate(zip(tail_offsets, tail_offsets[1:])) for start in range(begin, end, 128)]
