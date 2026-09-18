@@ -5,7 +5,7 @@ https://www.apache.org/licenses/LICENSE-2.0
 """
 from __future__ import annotations
 from functools import partial
-from flashinfer.jit.cake_kda_tf32 import _factory
+from flashinfer.jit.cake_kda_tf32 import _factory, device_arch as detect_gpu_arch
 'Canonical semantic and ABI compile axes shared by KDA schedules.'
 from enum import Enum
 
@@ -130,13 +130,6 @@ def _build_persistent_scalar_schedule(sequence_lengths: list[int], num_heads: in
 
 def gpu_spec_by_sku(sku):
     return {'B200': {'sku': 'NVIDIA B200 (Blackwell SXM, HBM3e 192GB)', 'compute_capability': [10, 0], 'arch_flag': 'sm_100a', 'hbm': {'capacity_gb': 192, 'peak_bandwidth_gbps': 8000, 'stack_count': 8, 'stack_tech': 'HBM3e'}, 'compute': {'tensor_peak_tflops': {'bf16_dense': 2250, 'fp16_dense': 2250, 'fp8_dense': 4500, 'fp4_dense': 9000}}, 'execution': {'max_threads_per_sm': 2048}, 'smem': {'kb_per_sm': 228, 'max_dynamic_bytes_per_kernel': 232448}, 'tmem': {'kb_per_sm': 256, 'cols_per_sm': 512}, 'notes': 'Blackwell SXM. Compute-capability 10.0 with .a suffix (sm_100a). The .a suffix enables tcgen05.mma / tcgen05.ld / cta_group::2 intrinsics. Live SM count + boost clock are read from pynvml (loom/runtime/hardware.py).'}, 'B300': {'sku': 'NVIDIA B300 (Blackwell Ultra SXM, HBM3e 288GB)', 'compute_capability': [10, 3], 'arch_flag': 'sm_103a', 'hbm': {'capacity_gb': 288, 'peak_bandwidth_gbps': 8000, 'stack_count': 8, 'stack_tech': 'HBM3e 12-high'}, 'compute': {'tensor_peak_tflops': {'bf16_dense': 2250, 'fp16_dense': 2250, 'fp8_dense': 4500, 'fp4_dense': 9000}}, 'execution': {'max_threads_per_sm': 2048}, 'smem': {'kb_per_sm': 228, 'max_dynamic_bytes_per_kernel': 232448}, 'tmem': {'kb_per_sm': 256, 'cols_per_sm': 512}, 'notes': 'Blackwell Ultra SXM. Compute-capability 10.3 with .a suffix (sm_103a). HBM bandwidth and per-dtype dense TFLOPS match B200 silicon; the user-visible difference is the 288GB HBM capacity (vs B200 192GB) and the sm_103 .a-suffix tcgen05 intrinsic set. Live SM count + boost clock are read from pynvml (loom/runtime/hardware.py).'}}.get(sku)
-
-def detect_gpu_arch():
-    import torch
-    major, minor = torch.cuda.get_device_capability()
-    if (major, minor) != (10, 3):
-        raise NotImplementedError('This TF32 export requires SM103a')
-    return 'sm_103a'
 
 def _build_kda_module(factory, *args, **kwargs):
     return factory(*args, **kwargs)

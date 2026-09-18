@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from flashinfer import prepare_tf32_kda_prefill
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10,3), reason='TF32 KDA export requires SM103a')
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10,0), (10,3)), reason='TF32 KDA export requires SM100a or SM103a')
 
 
 @pytest.mark.parametrize('lengths',[(17,), (64,), (17,65)])
