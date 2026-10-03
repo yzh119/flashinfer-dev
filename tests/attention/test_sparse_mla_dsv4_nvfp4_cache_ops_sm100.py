@@ -402,10 +402,11 @@ def test_sparse_backend_still_refuses_sm100_family() -> None:
     "num_heads,expected",
     [
         (128, "nvfp4_h128_prefill_persistent"),
-        (64, "nvfp4_h128_prefill_persistent"),
-        (32, "nvfp4_h128_prefill_persistent_thin_heads"),
-        (16, "nvfp4_h128_prefill_persistent_thin_heads"),
-        (8, "nvfp4_h128_prefill_persistent_thin_heads"),
+        (96, "nvfp4_h128_prefill_persistent_thin_heads"),
+        (64, "nvfp4_h64_prefill_persistent"),
+        (32, "nvfp4_h64_prefill_persistent"),
+        (16, "nvfp4_h64_prefill_persistent"),
+        (8, "nvfp4_h64_prefill_persistent"),
     ],
 )
 def test_nvfp4_prefill_route_key(num_heads: int, expected: str) -> None:

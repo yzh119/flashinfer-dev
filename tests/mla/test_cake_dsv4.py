@@ -2384,8 +2384,7 @@ _NVFP4_H64_PLAN = _plan(
     *(
         entry
         for entry in _NVFP4_PLAN
-        if entry[1]
-        not in ("tmap_o", "sparse_topk", "total_work_items", "max_q_len")
+        if entry[1] not in ("tmap_o", "sparse_topk", "total_work_items", "max_q_len")
         and entry[0] != "grid"
     )
 )

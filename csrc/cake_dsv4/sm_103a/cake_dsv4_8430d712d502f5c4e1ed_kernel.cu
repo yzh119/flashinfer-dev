@@ -397,7 +397,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(640, 1) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_b2574246c7b7e812d89b(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_q_sf, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_swa_sf, const __grid_constant__ CUtensorMap tmap_compressed_sf, const __grid_constant__ CUtensorMap tmap_o, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int max_q_len, int swa_page_log2, int swa_pitch_units, int swa_footer_units, int compressed_page_log2, int compressed_pitch_units, int compressed_footer_units, int swa_width, int compressed_width, int* __restrict__ extra_topk_lens)
+kernel_cake_dsv4_8430d712d502f5c4e1ed(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_q_sf, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_swa_sf, const __grid_constant__ CUtensorMap tmap_compressed_sf, const __grid_constant__ CUtensorMap tmap_o, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int max_q_len, int swa_page_log2, int swa_pitch_units, int swa_footer_units, int compressed_page_log2, int compressed_pitch_units, int compressed_footer_units, int swa_width, int compressed_width, int* __restrict__ extra_topk_lens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -955,12 +955,10 @@ kernel_cake_dsv4_b2574246c7b7e812d89b(const __grid_constant__ CUtensorMap tmap_q
                             k70 = k70 | sf_a[sf_s_1] + 269488144 | sf_b[sf_s_1] + 269488144;
                             k78 = k78 | sf_a[sf_s_1] + 134744072 | sf_b[sf_s_1] + 134744072;
                         }
-                        float e_lvl = (float)((k68 & 2155905152u) != 0) + (float)((k70 & 2155905152u) != 0) + (float)((k78 & 2155905152u) != 0);
-                        float _warp_reduce_0 = e_lvl;
-                        #pragma unroll
-                        for (int offset = 16; offset > 0; offset >>= 1)
-                            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-                        e_lvl = _warp_reduce_0;
+                        int _vote_0 = __any_sync(0xFFFFFFFF, (k68 & 2155905152u) != 0);
+                        int _vote_1 = __any_sync(0xFFFFFFFF, (k70 & 2155905152u) != 0);
+                        int _vote_2 = __any_sync(0xFFFFFFFF, (k78 & 2155905152u) != 0);
+                        float e_lvl = (float)(_vote_0 != 0) + (float)(_vote_1 != 0) + (float)(_vote_2 != 0);
                         if (elect_sync()) {
                             smem_kmax[p_stage * 4 + load_warp_rank] = e_lvl;
                         }
@@ -1334,7 +1332,6 @@ kernel_cake_dsv4_b2574246c7b7e812d89b(const __grid_constant__ CUtensorMap tmap_q
             float softmax_scale_log2 = bmm1_scale[0] * 1.4426950408889634f;
             const int wg_dummy_inc = 0;
             int all_num_kv_tiles_1 = (sparse_topk + 128 - 1) / 128;
-            int sm_first = 1;
             const int tmem_row_base_1 = ((1) ? warp % 2 * 32 : warp % 4 * 32);
             const int tmem_score_row_base = ((1) ? (int)(warp % 4 * 32) : tmem_row_base_1);
             const int n_half = ((1) ? (int)(warp % 4 / 2) : 0);
@@ -1379,20 +1376,6 @@ kernel_cake_dsv4_b2574246c7b7e812d89b(const __grid_constant__ CUtensorMap tmap_q
                     int tiles_per_split_1 = all_num_kv_tiles_1 + 1 - 1;
                     int first_tile_1 = split_idx_1 * tiles_per_split_1;
                     int num_kv_tiles_1 = tiles_per_split_1;
-                    if (sm_first != 0) {
-                        if (warp == 0) {
-                            mbarrier_wait(q_empty_addr, sm_item & 1 ^ 1);
-                            if (elect_sync()) {
-                                mbarrier_arrive_expect_tx(nvfp4_q_load_full_addr, 26624);
-                                int row0 = bid % 2 * 64;
-                                tma_3d_gmem2smem(smem_q_a_addr, (&tmap_q), 0, row0, mapped_query_idx_2, nvfp4_q_load_full_addr);
-                                tma_3d_gmem2smem(smem_q_b_addr, (&tmap_q), 128, row0, mapped_query_idx_2, nvfp4_q_load_full_addr);
-                                tma_3d_gmem2smem(smem_q_rope_addr, (&tmap_q), 224, row0, mapped_query_idx_2, nvfp4_q_load_full_addr);
-                                tma_3d_gmem2smem(smem_q_sf_addr, (&tmap_q_sf), 352, row0, mapped_query_idx_2, nvfp4_q_load_full_addr);
-                            }
-                        }
-                        sm_first = 0;
-                    }
                     mbarrier_wait(nvfp4_q_load_full_addr, sm_item & 1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     unsigned int sfa_regs[32];
@@ -1468,8 +1451,8 @@ kernel_cake_dsv4_b2574246c7b7e812d89b(const __grid_constant__ CUtensorMap tmap_q
                         #pragma unroll
                         for (int w = 0; w < 2; w++) {
                             asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&staged_index[w])) : "r"(index_lane_addr + w * 128));
-                            unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, staged_index[w] < 0);
-                            invalid_cols[w] = _vote_0;
+                            unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, staged_index[w] < 0);
+                            invalid_cols[w] = _vote_3;
                             any_invalid = any_invalid | invalid_cols[w];
                         }
                         if ((tile_1 & 1) != 0 || tile_1 + 1 == num_kv_tiles_1) {
@@ -2046,21 +2029,6 @@ kernel_cake_dsv4_b2574246c7b7e812d89b(const __grid_constant__ CUtensorMap tmap_q
                     }
                     source_work_x_2 = _clc_ctaid_15 + (unsigned int)cta_rank;
                     source_work_z_2 = _clc_ctaid_17;
-                    int sm_next_q = source_work_z_2 * (unsigned int)max_q_len + (source_work_x_2 >> 1);
-                    if (sm_next_q < num_query_tokens) {
-                        if (warp == 0) {
-                            mbarrier_wait(q_empty_addr, sm_item & 1 ^ 1);
-                            if (elect_sync()) {
-                                mbarrier_arrive_expect_tx(nvfp4_q_load_full_addr, 26624);
-                                int row0_1 = bid % 2 * 64;
-                                tma_3d_gmem2smem(smem_q_a_addr, (&tmap_q), 0, row0_1, sm_next_q, nvfp4_q_load_full_addr);
-                                tma_3d_gmem2smem(smem_q_b_addr, (&tmap_q), 128, row0_1, sm_next_q, nvfp4_q_load_full_addr);
-                                tma_3d_gmem2smem(smem_q_rope_addr, (&tmap_q), 224, row0_1, sm_next_q, nvfp4_q_load_full_addr);
-                                tma_3d_gmem2smem(smem_q_sf_addr, (&tmap_q_sf), 352, row0_1, sm_next_q, nvfp4_q_load_full_addr);
-                            }
-                        }
-                        sm_first = 0;
-                    }
                 }
             }
             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
@@ -2155,8 +2123,8 @@ kernel_cake_dsv4_b2574246c7b7e812d89b(const __grid_constant__ CUtensorMap tmap_q
                             asm volatile("tcgen05.fence::after_thread_sync;");
                         }
                         {
-                            int _vote_1 = __any_sync(0xFFFFFFFF, acc_scale_1 < 1.0f);
-                            int any_rescale = _vote_1;
+                            int _vote_4 = __any_sync(0xFFFFFFFF, acc_scale_1 < 1.0f);
+                            int any_rescale = _vote_4;
                             if (any_rescale != 0) {
                                 #pragma unroll
                                 for (int vs = 0; vs < 2; vs++) {
@@ -2413,6 +2381,17 @@ kernel_cake_dsv4_b2574246c7b7e812d89b(const __grid_constant__ CUtensorMap tmap_q
                     int tiles_per_split_3 = all_num_kv_tiles_3 + 1 - 1;
                     int first_tile_3 = split_idx_3 * tiles_per_split_3;
                     int num_kv_tiles_3 = tiles_per_split_3;
+                    if (warp == 8) {
+                        mbarrier_wait(q_empty_addr, mma_item & 1 ^ 1);
+                        if (elect_sync()) {
+                            mbarrier_arrive_expect_tx(nvfp4_q_load_full_addr, 26624);
+                            int row0 = bid % 2 * 64;
+                            tma_3d_gmem2smem(smem_q_a_addr, (&tmap_q), 0, row0, mapped_query_idx_4, nvfp4_q_load_full_addr);
+                            tma_3d_gmem2smem(smem_q_b_addr, (&tmap_q), 128, row0, mapped_query_idx_4, nvfp4_q_load_full_addr);
+                            tma_3d_gmem2smem(smem_q_rope_addr, (&tmap_q), 224, row0, mapped_query_idx_4, nvfp4_q_load_full_addr);
+                            tma_3d_gmem2smem(smem_q_sf_addr, (&tmap_q_sf), 352, row0, mapped_query_idx_4, nvfp4_q_load_full_addr);
+                        }
+                    }
                     {
                         if (cta_rank == 0) {
                             mbarrier_wait(q_full_addr, _phase_q_full_0_3);

@@ -23,7 +23,7 @@ kernel-error gate: O ``atol=rtol=5e-2``, LSE ``atol=rtol=2e-2``). The grid
 covers single and dual caches, independent main/extra lengths, ``-1``
 padding, rows without a valid entry, sinks, partial KV tiles, odd token
 counts, HND/NHD, padded page pitches, column-sliced tables, CUDA-graph replay,
-the thin-head epilogue variant (8/16/32 heads) and the tracking rows (K=256,
+the single-CTA variant (up to 64 heads) and the tracking rows (K=256,
 8 heads, non-default page sizes). The trtllm-gen DSv4 entry point keeps
 refusing the NVFP4 cache on SM100/SM103.
 """
@@ -473,11 +473,14 @@ def test_nvfp4_prefill_cuda_graph_replay() -> None:
         _check(case, out, lse)
 
 
-@pytest.mark.parametrize("heads", [8, 16, 32, 64, 128])
+@pytest.mark.parametrize("heads", [8, 16, 32, 64, 96, 128])
 def test_nvfp4_route_selection_matches_head_count(heads: int) -> None:
-    expected = "nvfp4_h128_prefill_persistent" + (
-        "" if heads % 64 == 0 else "_thin_heads"
-    )
+    if heads <= 64:
+        expected = "nvfp4_h64_prefill_persistent"
+    else:
+        expected = "nvfp4_h128_prefill_persistent" + (
+            "" if heads % 64 == 0 else "_thin_heads"
+        )
     assert _nvfp4_route(heads) == expected
 
 
