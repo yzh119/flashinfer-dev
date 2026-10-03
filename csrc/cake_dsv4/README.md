@@ -2,54 +2,53 @@
 
 Current support covers SM100 and SM103. The complete current 94-case tables, comparisons, runtime and hardware evidence are in the [current SM100](https://github.com/flashinfer-ai/flashinfer/pull/4573#current-sm100-validation) and [current SM103](https://github.com/flashinfer-ai/flashinfer/pull/4573#current-sm103-validation) PR sections.
 
-## NVFP4 (384-byte) cache route
+## NVFP4 (384-byte) cache prefill (SM100/SM103)
 
-`kv_cache_format="nvfp4"` with `backend="cake"` selects the native NVFP4 DeepSeek-V4
-sparse-MLA prefill body on SM100 and SM103: the query stays BF16 (its 448 NoPE
-dims are quantised to NVFP4 in-kernel, the 64 RoPE dims stay BF16), both pools
-are the opaque 384-byte paged cache written by
-`nvfp4_quantize_pack_sparse_mla_cache` / `nvfp4_quantize_append_sparse_mla_cache`
-(`page_size * 352` data bytes followed by a `page_size * 32` scale footer per page,
-HND or NHD, any page pitch that is a multiple of 32 bytes), and QK runs as a
-tcgen05 block-scaled MMA directly on the E2M1 data with the footer scales.
-The metadata is the two-segment form of the SM120 NVFP4 route: `sparse_indices
-[T, K_main]` indexes the main pool with active lengths `swa_topk_lens [T]`,
-`extra_sparse_indices [T, K_extra]` indexes the compressed pool with independent
-`extra_sparse_topk_lens [T]`, `-1` entries are masked, and rows with no valid
-entry produce zeros (and `-inf` LSE without a sink). One persistent two-CTA body
-serves every head count up to 128; head counts that are not a multiple of 64 run
-its plain-store epilogue variant (`nvfp4_h128_prefill_persistent_thin_heads`).
-The base-2 LSE of every (token, head) is written into the workspace and exposed
-by `flashinfer.mla.cake_dsv4_nvfp4_lse`. P is accumulated in FP32 and the online
-softmax order is fixed (one KV tile of 128 slots at a time, main segment first);
-the P operand of PV is E4M3, the same precision as the SM120 NVFP4 route.
+`flashinfer.mla.cake_sparse_mla_sm100_dsv4_nvfp4_prefill` is the separate entry
+point for DeepSeek-V4 caches in the 384-byte NVFP4 row format on SM100 and
+SM103 (the dense-cache `trtllm_batch_decode_sparse_mla_dsv4` API does not take
+this cache there). The query and both pools use the row format written by
+`nvfp4_quantize_pack_sparse_mla_cache` / `nvfp4_quantize_append_sparse_mla_cache`:
+the 448 NoPE dims as packed E2M1 with one E4M3 scale per 16 values, the 64 RoPE
+dims in BF16; pools store `page_size * 352` data bytes followed by a
+`page_size * 32` scale footer per page (HND or NHD, any page pitch that is a
+multiple of 32 bytes). QK runs as a tcgen05 block-scaled MMA directly on the
+E2M1 data with the footer scales (BF16 for the RoPE dims); PV runs FP8 with V
+dequantised to E4M3 in-kernel. The metadata is the two-segment form of the
+SM120 NVFP4 entry points: `indices [T, K_main]` indexes the main pool with
+active lengths `topk_length [T]`, `extra_indices [T, K_extra]` indexes the
+compressed pool with independent `extra_topk_length [T]`, `-1` entries are
+masked, and rows with no valid entry produce zeros (and `-inf` LSE without a
+sink). One persistent two-CTA body serves every head count up to 128; head
+counts that are not a multiple of 64 run its plain-store epilogue variant
+(`nvfp4_h128_prefill_persistent_thin_heads`). `output` and the base-2 `out_lse`
+are caller-owned; the call allocates nothing and needs no workspace. P is
+accumulated in FP32 and the online softmax order is fixed (one KV tile of 128
+slots at a time, main segment first); the P operand of PV is E4M3, the same
+precision as the SM120 NVFP4 route.
 
 ```python
 from flashinfer.mla import (
-    cake_dsv4_nvfp4_lse,
+    cake_sparse_mla_sm100_dsv4_nvfp4_prefill,
     nvfp4_quantize_pack_sparse_mla_cache,
-    trtllm_batch_decode_sparse_mla_dsv4,
 )
 
 main_cache = nvfp4_quantize_pack_sparse_mla_cache(main_latent_pages)      # [pages, 1, 64, 384]
 extra_cache = nvfp4_quantize_pack_sparse_mla_cache(extra_latent_pages)    # [pages, 1, 64, 384]
-out = trtllm_batch_decode_sparse_mla_dsv4(
-    query, main_cache, workspace_buffer, main_indices,
-    compressed_kv_cache=extra_cache,
-    swa_topk_lens=main_lens,
-    extra_sparse_indices=extra_indices,
-    extra_sparse_topk_lens=extra_lens,
-    seq_lens=seq_lens,
-    cum_seq_lens_q=cum_seq_lens_q, max_q_len=max_q_len,
-    sinks=sinks, bmm1_scale=512**-0.55, bmm2_scale=1.0,
-    backend="cake", kv_cache_format="nvfp4",
+q_nvfp4 = nvfp4_quantize_pack_sparse_mla_cache(
+    query.reshape(T * H, 1, 512)                                          # BF16 [T, H, 512]
+).view(T, H, 384)
+cake_sparse_mla_sm100_dsv4_nvfp4_prefill(
+    q_nvfp4, main_cache, main_indices, out, lse, 512**-0.55,
+    topk_length=main_lens, attn_sink=sinks,
+    extra_kv_cache=extra_cache, extra_indices=extra_indices,
+    extra_topk_length=extra_lens,
 )
-lse = cake_dsv4_nvfp4_lse(workspace_buffer, num_query_tokens, num_heads)
 ```
 
-Tests: `tests/mla/test_cake_dsv4_nvfp4.py` (route, SM100/SM103 GPUs),
-`tests/attention/test_sparse_mla_dsv4_nvfp4_cache_ops_sm100.py` (cache ops and the
-public gate), `tests/mla/test_cake_dsv4.py` (host binding). Benchmark:
+Tests: `tests/mla/test_cake_dsv4_nvfp4.py` (SM100/SM103 GPUs),
+`tests/attention/test_sparse_mla_dsv4_nvfp4_cache_ops_sm100.py` (cache ops),
+`tests/mla/test_cake_dsv4.py` (host binding). Benchmark:
 `benchmarks/bench_cake_dsv4_nvfp4_prefill.py`.
 
 ## Historical SM103 implementation and validation

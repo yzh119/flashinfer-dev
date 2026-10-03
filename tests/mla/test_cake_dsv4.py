@@ -1348,27 +1348,6 @@ def test_metadata_param_vocabulary_is_bindable():
     assert not cake.is_bindable_arg("parameter", "completion_base")
 
 
-def test_nvfp4_vocabulary_is_bindable():
-    """Every argument of the NVFP4 persistent body has a host value name."""
-    for kind, name in _NVFP4_PLAN:
-        if kind == "grid":
-            continue
-        assert cake.is_bindable_arg(kind, name), (kind, name)
-    assert cake.canonical_arg_name("tma_buffer", "tmap_swa_sf") == "SWA_sf"
-    assert (
-        cake.canonical_arg_name("tma_buffer", "tmap_compressed_sf")
-        == "compressed_KV_sf"
-    )
-    assert (
-        cake._nvfp4_route(128)
-        == cake._nvfp4_route(64)
-        == "nvfp4_h128_prefill_persistent"
-    )
-    for heads in (8, 16, 32):
-        assert cake._nvfp4_route(heads) == "nvfp4_h128_prefill_persistent_thin_heads"
-    assert cake._NVFP4_ROUTES <= cake._RAGGED_ONLY_ROUTES
-
-
 _FAKE_PLAN = [
     ("parameter", "sparse_topk_lens_offset"),
     ("tma_buffer", "tmap_swa_kv"),
@@ -2362,12 +2341,12 @@ def test_fp8_h64_rows_follow_the_persistent_body_rule(
 
 
 # --------------------------------------------------------------------------- #
-# NVFP4 (384-byte cache) route: host mapping on CPU tensors                   #
+# NVFP4 (384-byte cache) entry point: host mapping on CPU tensors             #
 # --------------------------------------------------------------------------- #
 
 _NVFP4_PLAN = _plan(
     ("tma_buffer", "tmap_q"),
-    ("buffer", "Q"),
+    ("tma_buffer", "tmap_q_sf"),
     ("tma_buffer", "tmap_swa_kv"),
     ("tma_buffer", "tmap_compressed_kv"),
     ("tma_buffer", "tmap_swa_sf"),
@@ -2375,12 +2354,9 @@ _NVFP4_PLAN = _plan(
     ("tma_buffer", "tmap_o"),
     ("buffer", "O"),
     ("buffer", "LSE"),
-    ("buffer", "partial_lse"),
     ("buffer", "swa_indices"),
     ("buffer", "compressed_indices"),
     ("buffer", "sparse_topk_lens"),
-    ("buffer", "seq_lens"),
-    ("buffer", "cum_seq_lens_q"),
     ("buffer", "sinks"),
     ("buffer", "bmm1_scale"),
     ("buffer", "bmm2_scale"),
@@ -2393,7 +2369,6 @@ _NVFP4_PLAN = _plan(
     ("parameter", "has_sinks"),
     ("parameter", "total_work_items"),
     ("parameter", "max_q_len"),
-    ("parameter", "batch_size"),
     ("parameter", "swa_page_log2"),
     ("parameter", "swa_pitch_units"),
     ("parameter", "swa_footer_units"),
@@ -2405,6 +2380,27 @@ _NVFP4_PLAN = _plan(
     ("buffer", "extra_topk_lens"),
 )
 _NVFP4_BYTES = 384
+
+
+def test_nvfp4_vocabulary_is_bindable():
+    """Every argument of the NVFP4 persistent body has a host value name."""
+    for kind, name in _NVFP4_PLAN:
+        if kind == "grid":
+            continue
+        assert cake.is_bindable_arg(kind, name), (kind, name)
+    assert cake.canonical_arg_name("tma_buffer", "tmap_q_sf") == "Q"
+    assert cake.canonical_arg_name("tma_buffer", "tmap_swa_sf") == "SWA_sf"
+    assert (
+        cake.canonical_arg_name("tma_buffer", "tmap_compressed_sf")
+        == "compressed_KV_sf"
+    )
+    assert (
+        cake._nvfp4_route(128)
+        == cake._nvfp4_route(64)
+        == "nvfp4_h128_prefill_persistent"
+    )
+    for heads in (8, 16, 32):
+        assert cake._nvfp4_route(heads) == "nvfp4_h128_prefill_persistent_thin_heads"
 
 
 def _nvfp4_pool(
@@ -2427,7 +2423,7 @@ def _nvfp4_pool(
 def test_nvfp4_pool_geometry_views(layout, pad_tokens):
     pages, page_size = 5, 64
     cache = _nvfp4_pool(pages, page_size, layout=layout, pad_tokens=pad_tokens)
-    geometry = cake.nvfp4_pool_geometry(cache, "swa_kv_cache")
+    geometry = cake.nvfp4_pool_geometry(cache, "kv_cache")
     pitch = (page_size + pad_tokens) * _NVFP4_BYTES
     total = (pages - 1) * pitch + page_size * _NVFP4_BYTES
     assert geometry.pages == pages and geometry.page_size == page_size
@@ -2457,7 +2453,7 @@ def test_nvfp4_pool_geometry_views(layout, pad_tokens):
 
 def test_nvfp4_pool_geometry_accepts_three_dim_pool_and_single_page():
     cache = _aligned_u8(2 * _NVFP4_BYTES).view(1, 2, _NVFP4_BYTES)
-    geometry = cake.nvfp4_pool_geometry(cache, "compressed_kv_cache")
+    geometry = cake.nvfp4_pool_geometry(cache, "extra_kv_cache")
     assert geometry.page_size == 2 and geometry.page_log2 == 1
     assert (
         geometry.pitch_units == 2 * _NVFP4_BYTES // 32 and geometry.footer_units == 22
@@ -2465,33 +2461,32 @@ def test_nvfp4_pool_geometry_accepts_three_dim_pool_and_single_page():
 
 
 def test_nvfp4_pool_geometry_errors():
-    with pytest.raises(ValueError, match="must be uint8"):
+    with pytest.raises(ValueError, match="uint8 NVFP4 pool"):
         cake.nvfp4_pool_geometry(
-            torch.zeros((2, 1, 64, 512), dtype=torch.bfloat16), "swa_kv_cache"
+            torch.zeros((2, 1, 64, 512), dtype=torch.bfloat16), "kv_cache"
         )
     with pytest.raises(ValueError, match="packed NVFP4 pool"):
         cake.nvfp4_pool_geometry(
-            torch.zeros((2, 1, 64, 512), dtype=torch.uint8), "swa_kv_cache"
+            torch.zeros((2, 1, 64, 512), dtype=torch.uint8), "kv_cache"
         )
     with pytest.raises(ValueError, match="power of two"):
         cake.nvfp4_pool_geometry(
-            _aligned_u8(2 * 3 * _NVFP4_BYTES).view(2, 1, 3, _NVFP4_BYTES),
-            "swa_kv_cache",
+            _aligned_u8(2 * 3 * _NVFP4_BYTES).view(2, 1, 3, _NVFP4_BYTES), "kv_cache"
         )
     with pytest.raises(ValueError, match="contiguous inside each page"):
         cache = _aligned_u8(2 * 64 * 2 * _NVFP4_BYTES).as_strided(
             (2, 1, 64, _NVFP4_BYTES),
             (64 * 2 * _NVFP4_BYTES, _NVFP4_BYTES, 2 * _NVFP4_BYTES, 1),
         )
-        cake.nvfp4_pool_geometry(cache, "swa_kv_cache")
+        cake.nvfp4_pool_geometry(cache, "kv_cache")
     with pytest.raises(ValueError, match="page stride must be a multiple of 32"):
         cache = _aligned_u8(2 * 64 * _NVFP4_BYTES + 16).as_strided(
             (2, 1, 64, _NVFP4_BYTES), (64 * _NVFP4_BYTES + 16, 1, _NVFP4_BYTES, 1)
         )
-        cake.nvfp4_pool_geometry(cache, "swa_kv_cache")
+        cake.nvfp4_pool_geometry(cache, "kv_cache")
     with pytest.raises(ValueError, match="singleton KV-head axis"):
         cake.nvfp4_pool_geometry(
-            torch.zeros((2, 2, 64, _NVFP4_BYTES), dtype=torch.uint8), "swa_kv_cache"
+            torch.zeros((2, 2, 64, _NVFP4_BYTES), dtype=torch.uint8), "kv_cache"
         )
 
 
@@ -2508,28 +2503,32 @@ def _nvfp4_tables(rows: int, main_width: int, extra_width: int = 0):
     return main, main_lens, extra, extra_lens
 
 
+def _nvfp4_meta(indices, lens, *, extra=None, extra_lens=None, rows=4):
+    return cake._resolve_nvfp4_metadata(
+        indices,
+        lens,
+        extra_indices=extra,
+        extra_topk_length=extra_lens,
+        query_rows=rows,
+    )
+
+
 def test_nvfp4_metadata_resolution_single_and_dual_segments():
     main, main_lens, _, _ = _nvfp4_tables(4, 512)
-    meta = cake.resolve_cake_dsv4_nvfp4_metadata(main, main_lens, query_rows=6)
+    meta = _nvfp4_meta(main, main_lens)
     assert meta.main_width == 512 and meta.extra_width == 0 and meta.sparse_topk == 512
     assert meta.main_indices is main and meta.extra_indices is main
     assert meta.extra_lens is None and meta.num_query_tokens == 4
     assert meta.main_index_stride == meta.extra_index_stride == 512
+    full = _nvfp4_meta(main, None)
+    assert full.main_lens.tolist() == [512] * 4
     main, main_lens, extra, extra_lens = _nvfp4_tables(4, 128, 512)
-    meta = cake.resolve_cake_dsv4_nvfp4_metadata(
-        main,
-        main_lens,
-        extra_sparse_indices=extra,
-        extra_sparse_topk_lens=extra_lens,
-        query_rows=4,
-    )
+    meta = _nvfp4_meta(main, main_lens, extra=extra, extra_lens=extra_lens)
     assert meta.sparse_topk == 640 and meta.extra_width == 512
     assert meta.extra_indices is extra and meta.extra_lens is extra_lens
     # Row-strided views of a wider table are handed over as contiguous spans.
     wide = torch.arange(4 * 1024, dtype=torch.int32).reshape(4, 1024)
-    meta = cake.resolve_cake_dsv4_nvfp4_metadata(
-        wide[:, :256], main_lens, extra_sparse_indices=wide[:, 256:768], query_rows=4
-    )
+    meta = _nvfp4_meta(wide[:, :256], main_lens, extra=wide[:, 256:768])
     assert meta.main_index_stride == meta.extra_index_stride == 1024
     assert meta.main_indices.data_ptr() == wide.data_ptr()
     assert meta.extra_indices.data_ptr() == wide.data_ptr() + 256 * 4
@@ -2540,35 +2539,25 @@ def test_nvfp4_metadata_resolution_single_and_dual_segments():
 def test_nvfp4_metadata_resolution_errors():
     main, main_lens, extra, extra_lens = _nvfp4_tables(4, 128, 512)
     with pytest.raises(ValueError, match="at least the 128-slot main window"):
-        cake.resolve_cake_dsv4_nvfp4_metadata(main[:, :64], main_lens, query_rows=4)
+        _nvfp4_meta(main[:, :64], main_lens)
     with pytest.raises(ValueError, match="multiple of 4"):
-        cake.resolve_cake_dsv4_nvfp4_metadata(
-            main, main_lens, extra_sparse_indices=extra[:, :130], query_rows=4
-        )
+        _nvfp4_meta(main, main_lens, extra=extra[:, :130])
     with pytest.raises(ValueError, match="16-byte aligned"):
-        cake.resolve_cake_dsv4_nvfp4_metadata(
-            main, main_lens, extra_sparse_indices=extra[:, 1:129], query_rows=4
-        )
-    with pytest.raises(ValueError, match="only has 3"):
-        cake.resolve_cake_dsv4_nvfp4_metadata(main, main_lens, query_rows=3)
-    with pytest.raises(ValueError, match="requires extra_sparse_indices"):
-        cake.resolve_cake_dsv4_nvfp4_metadata(
-            main, main_lens, extra_sparse_topk_lens=extra_lens, query_rows=4
-        )
+        _nvfp4_meta(main, main_lens, extra=extra[:, 1:129])
+    with pytest.raises(ValueError, match="one row per query token"):
+        _nvfp4_meta(main, main_lens, rows=3)
+    with pytest.raises(ValueError, match="requires extra_indices"):
+        _nvfp4_meta(main, main_lens, extra_lens=extra_lens)
     with pytest.raises(ValueError, match="must have 4 entries"):
-        cake.resolve_cake_dsv4_nvfp4_metadata(main, main_lens[:3], query_rows=4)
+        _nvfp4_meta(main, main_lens[:3])
     with pytest.raises(ValueError, match="exceeds the NVFP4"):
-        huge = torch.zeros((4, 1024), dtype=torch.int32)
-        cake.resolve_cake_dsv4_nvfp4_metadata(
+        _nvfp4_meta(
             torch.zeros((4, 256), dtype=torch.int32),
             main_lens,
-            extra_sparse_indices=huge,
-            query_rows=4,
+            extra=torch.zeros((4, 1024), dtype=torch.int32),
         )
     with pytest.raises(ValueError, match="unit column stride"):
-        cake.resolve_cake_dsv4_nvfp4_metadata(
-            main.t().contiguous().t(), main_lens, query_rows=4
-        )
+        _nvfp4_meta(main.t().contiguous().t(), main_lens)
 
 
 def _run_fake_nvfp4(
@@ -2579,95 +2568,69 @@ def _run_fake_nvfp4(
     main_width,
     extra_width=0,
     extra_lens=True,
-    query_rows=None,
-    cum_seq_lens_q=None,
-    max_q_len=2,
-    batch=3,
-    compressed_cache=True,
+    extra_cache=True,
     layout="HND",
     pad_tokens=0,
     sinks=True,
+    offset=0,
 ):
     route = cake._nvfp4_route(num_heads)
     recorder = _install_fake_variants(monkeypatch, {route: _NVFP4_PLAN})
     monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
-    monkeypatch.setattr(cake, "_stream_ptr", lambda device: 0)
-    query_rows = rows if query_rows is None else query_rows
     main, main_lens, extra, extra_lens_tensor = _nvfp4_tables(
         rows, main_width, extra_width
     )
-    workspace = _aligned_u8(
-        get_cake_dsv4_workspace_bytes(
-            rows, num_heads, main_width + extra_width, torch.bfloat16
-        )
+    query = _aligned_u8(rows * num_heads * _NVFP4_BYTES).view(
+        rows, num_heads, _NVFP4_BYTES
     )
-    query = torch.zeros((query_rows, num_heads, 512), dtype=torch.bfloat16)
-    out = torch.zeros((query_rows, num_heads, 512), dtype=torch.bfloat16)
+    out = torch.zeros((rows, num_heads, 512), dtype=torch.bfloat16)
+    lse = torch.zeros((rows, num_heads), dtype=torch.float32)
     main_cache = _nvfp4_pool(4, 64, layout=layout, pad_tokens=pad_tokens)
-    extra_cache = _nvfp4_pool(8, 2, layout=layout) if compressed_cache else None
+    second = _nvfp4_pool(8, 2, layout=layout) if extra_width and extra_cache else None
     sink_tensor = torch.zeros((num_heads,), dtype=torch.float32) if sinks else None
-    result = cake.run_cake_dsv4(
-        query=query,
-        swa_kv_cache=main_cache,
-        compressed_kv_cache=extra_cache,
-        workspace_buffer=workspace,
-        out=out,
-        bmm1_scale=0.5,
-        bmm2_scale=1.0,
-        sinks=sink_tensor,
-        max_q_len=max_q_len,
-        cum_seq_lens_q=cum_seq_lens_q,
-        seq_lens=torch.full((batch,), 1000, dtype=torch.int32),
-        backend="cake",
-        sparse_indices=main,
-        sparse_topk_lens=None,
-        swa_topk_lens=main_lens,
-        extra_sparse_indices=extra,
-        extra_sparse_topk_lens=extra_lens_tensor if extra_lens else None,
-        kv_cache_format="nvfp4",
+    cake.cake_sparse_mla_sm100_dsv4_nvfp4_prefill(
+        query,
+        main_cache,
+        main,
+        out,
+        lse,
+        0.5,
+        topk_length=main_lens,
+        topk_length_offset=offset,
+        attn_sink=sink_tensor,
+        extra_kv_cache=second,
+        extra_indices=extra,
+        extra_topk_length=extra_lens_tensor if extra_lens else None,
     )
-    assert result is out
     (call,) = recorder.calls
     bound = dict(zip((name for _, name in _NVFP4_PLAN), call, strict=True))
     env = dict(
         query=query,
         out=out,
+        lse=lse,
         main=main,
         main_lens=main_lens,
         extra=extra,
         extra_lens=extra_lens_tensor,
         main_cache=main_cache,
-        extra_cache=extra_cache,
-        workspace=workspace,
+        extra_cache=second,
         sinks=sink_tensor,
         route=route,
     )
     return bound, env
 
 
-def test_run_cake_dsv4_nvfp4_binds_pools_segments_and_lse(monkeypatch):
+def test_nvfp4_prefill_binds_query_pools_segments_and_lse(monkeypatch):
     rows, heads = 5, 128
     bound, env = _run_fake_nvfp4(
-        monkeypatch,
-        num_heads=heads,
-        rows=rows,
-        main_width=128,
-        extra_width=512,
-        query_rows=7,
+        monkeypatch, num_heads=heads, rows=rows, main_width=128, extra_width=512
     )
     assert env["route"] == "nvfp4_h128_prefill_persistent"
-    # Query: BF16 rows feed tmap_q, the same bytes as uint32 feed the plain Q pointer.
-    assert bound["tmap_q"].dtype == torch.bfloat16
-    assert bound["tmap_q"].data_ptr() == env["query"].data_ptr()
-    assert tuple(bound["tmap_q"].shape) == (rows, heads, 512)
-    assert (
-        bound["Q"].dtype == torch.uint32
-        and bound["Q"].data_ptr() == env["query"].data_ptr()
-    )
-    assert tuple(bound["Q"].shape) == (rows, heads, 256)
+    # Query: the packed rows feed both query descriptors (data and scale rows).
+    assert bound["tmap_q"] is env["query"] and bound["tmap_q_sf"] is env["query"]
     # Pools: data rows and footer rows of each pool on a 32-byte pitch.
-    main_geo = cake.nvfp4_pool_geometry(env["main_cache"], "swa_kv_cache")
-    extra_geo = cake.nvfp4_pool_geometry(env["extra_cache"], "compressed_kv_cache")
+    main_geo = cake.nvfp4_pool_geometry(env["main_cache"], "kv_cache")
+    extra_geo = cake.nvfp4_pool_geometry(env["extra_cache"], "extra_kv_cache")
     for name, geo in (("swa", main_geo), ("compressed", extra_geo)):
         assert bound[f"tmap_{name}_kv"].data_ptr() == geo.data_map.data_ptr()
         assert tuple(bound[f"tmap_{name}_kv"].shape) == tuple(geo.data_map.shape)
@@ -2689,62 +2652,47 @@ def test_run_cake_dsv4_nvfp4_binds_pools_segments_and_lse(monkeypatch):
     assert bound["sparse_topk"] == 640
     assert bound["swa_index_stride"] == 128 and bound["compressed_index_stride"] == 512
     assert bound["sparse_topk_lens_offset"] == 0
-    # Output rows and the LSE / partial_lse workspace region.
-    assert bound["tmap_o"].data_ptr() == bound["O"].data_ptr() == env["out"].data_ptr()
-    assert tuple(bound["O"].shape) == (rows, heads, 512)
-    layout = cake_dsv4_workspace_layout(rows, heads, 1)
-    assert bound["LSE"].dtype == torch.float32 and bound["LSE"].numel() == rows * heads
-    assert (
-        bound["LSE"].data_ptr() == env["workspace"].data_ptr() + layout.partial_lse[0]
-    )
-    assert bound["partial_lse"].data_ptr() == bound["LSE"].data_ptr()
-    lse_view = cake.cake_dsv4_nvfp4_lse(env["workspace"], rows, heads)
-    assert lse_view.data_ptr() == bound["LSE"].data_ptr() and tuple(lse_view.shape) == (
-        rows,
-        heads,
-    )
+    # Caller-owned output and LSE.
+    assert bound["tmap_o"] is env["out"] and bound["O"] is env["out"]
+    assert bound["LSE"] is env["lse"]
     # Launch shape and scalars.
     assert bound["num_query_tokens"] == rows and bound["total_work_items"] == rows
+    assert bound["max_q_len"] == rows
     assert bound["num_heads"] == heads and bound["has_sinks"] == 1
     assert bound["sinks"] is env["sinks"]
-    assert bound["batch_size"] == 3 and bound["max_q_len"] == 2
+    assert bound["bmm1_scale"].tolist() == [0.5] and bound["bmm2_scale"].tolist() == [
+        1.0
+    ]
     assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (2 * rows, 1, 1)
-    # Dense query: the ragged-only body receives synthesized request offsets.
-    assert bound["cum_seq_lens_q"].tolist() == [0, 2, 4, 6]
 
 
 @pytest.mark.parametrize("num_heads", [8, 16, 32])
-def test_run_cake_dsv4_nvfp4_thin_heads_variant(monkeypatch, num_heads):
+def test_nvfp4_prefill_thin_heads_variant(monkeypatch, num_heads):
     bound, env = _run_fake_nvfp4(
         monkeypatch, num_heads=num_heads, rows=3, main_width=512
     )
     assert env["route"] == "nvfp4_h128_prefill_persistent_thin_heads"
     assert bound["num_heads"] == num_heads
-    assert tuple(bound["Q"].shape) == (3, num_heads, 256)
 
 
-def test_run_cake_dsv4_nvfp4_single_pool_without_compressed_cache(monkeypatch):
+def test_nvfp4_prefill_single_pool(monkeypatch):
     bound, env = _run_fake_nvfp4(
-        monkeypatch,
-        num_heads=64,
-        rows=4,
-        main_width=512,
-        compressed_cache=False,
-        sinks=False,
+        monkeypatch, num_heads=64, rows=4, main_width=512, sinks=False, offset=-96
     )
-    main_geo = cake.nvfp4_pool_geometry(env["main_cache"], "swa_kv_cache")
+    main_geo = cake.nvfp4_pool_geometry(env["main_cache"], "kv_cache")
     # The compressed descriptors alias the main pool; the extra table aliases the main table.
     assert bound["tmap_compressed_kv"].data_ptr() == main_geo.data_map.data_ptr()
     assert bound["tmap_compressed_sf"].data_ptr() == main_geo.sf_map.data_ptr()
     assert bound["compressed_page_log2"] == 6
     assert bound["compressed_indices"] is env["main"]
     assert bound["compressed_width"] == 0 and bound["sparse_topk"] == 512
+    assert bound["sparse_topk_lens_offset"] == -96
     # No compressed lengths exist; the never-read pointer is a valid int32 buffer.
     assert bound["extra_topk_lens"].dtype == torch.int32
     assert bound["has_sinks"] == 0 and bound["sinks"] is bound["bmm1_scale"]
 
 
-def test_run_cake_dsv4_nvfp4_omitted_extra_lengths_activate_every_column(monkeypatch):
+def test_nvfp4_prefill_omitted_extra_lengths_activate_every_column(monkeypatch):
     bound, _ = _run_fake_nvfp4(
         monkeypatch,
         num_heads=64,
@@ -2754,104 +2702,15 @@ def test_run_cake_dsv4_nvfp4_omitted_extra_lengths_activate_every_column(monkeyp
         extra_lens=False,
     )
     assert bound["extra_topk_lens"].tolist() == [256, 256, 256, 256]
-    again, _ = _run_fake_nvfp4(
-        monkeypatch,
-        num_heads=64,
-        rows=4,
-        main_width=128,
-        extra_width=256,
-        extra_lens=False,
-    )
-    assert again["extra_topk_lens"] is bound["extra_topk_lens"]
 
 
-@pytest.mark.parametrize("layout", ["HND", "NHD"])
-def test_run_cake_dsv4_nvfp4_page_stride_and_layout(monkeypatch, layout):
-    bound, env = _run_fake_nvfp4(
-        monkeypatch, num_heads=128, rows=2, main_width=128, layout=layout, pad_tokens=3
-    )
-    geo = cake.nvfp4_pool_geometry(env["main_cache"], "swa_kv_cache")
-    assert geo.pitch_units == (64 + 3) * 384 // 32
-    assert bound["swa_pitch_units"] == geo.pitch_units
-    assert bound["tmap_swa_kv"].data_ptr() == env["main_cache"].data_ptr()
-
-
-def test_run_cake_dsv4_nvfp4_ragged_offsets_pass_through(monkeypatch):
-    indptr = torch.tensor([0, 1, 3, 6], dtype=torch.int32)
-    bound, _ = _run_fake_nvfp4(
-        monkeypatch,
-        num_heads=128,
-        rows=6,
-        main_width=128,
-        cum_seq_lens_q=indptr,
-        max_q_len=3,
-    )
-    assert bound["cum_seq_lens_q"].data_ptr() == indptr.data_ptr()
-    assert bound["max_q_len"] == 3 and bound["batch_size"] == 3
-
-
-def test_run_cake_dsv4_nvfp4_rejects_combined_lengths_and_dense_pools(monkeypatch):
-    recorder = _install_fake_variants(
-        monkeypatch, {"nvfp4_h128_prefill_persistent": _NVFP4_PLAN}
-    )
-    monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
-    monkeypatch.setattr(cake, "_stream_ptr", lambda device: 0)
-    main, main_lens, _, _ = _nvfp4_tables(2, 128)
-    common = dict(
-        query=torch.zeros((2, 64, 512), dtype=torch.bfloat16),
-        compressed_kv_cache=None,
-        workspace_buffer=_aligned_u8(
-            get_cake_dsv4_workspace_bytes(2, 64, 128, torch.bfloat16)
-        ),
-        out=torch.zeros((2, 64, 512), dtype=torch.bfloat16),
-        bmm1_scale=0.5,
-        bmm2_scale=1.0,
-        sinks=None,
-        max_q_len=1,
-        cum_seq_lens_q=None,
-        seq_lens=torch.full((2,), 10, dtype=torch.int32),
-        backend="cake",
-        sparse_indices=main,
-        kv_cache_format="nvfp4",
-    )
-    pool = _nvfp4_pool(4, 64)
-    with pytest.raises(
-        ValueError, match="takes the main-segment lengths as swa_topk_lens"
-    ):
-        cake.run_cake_dsv4(swa_kv_cache=pool, sparse_topk_lens=None, **common)
-    with pytest.raises(ValueError, match="not the combined sparse_topk_lens"):
-        cake.run_cake_dsv4(
-            swa_kv_cache=pool,
-            sparse_topk_lens=main_lens,
-            swa_topk_lens=main_lens,
-            **common,
+def test_nvfp4_prefill_rejects_unpaired_extra_segment(monkeypatch):
+    with pytest.raises(ValueError, match="extra_indices requires extra_kv_cache"):
+        _run_fake_nvfp4(
+            monkeypatch,
+            num_heads=64,
+            rows=4,
+            main_width=128,
+            extra_width=256,
+            extra_cache=False,
         )
-    with pytest.raises(ValueError, match="must be uint8"):
-        cake.run_cake_dsv4(
-            swa_kv_cache=torch.zeros((4, 1, 64, 512), dtype=torch.bfloat16),
-            sparse_topk_lens=None,
-            swa_topk_lens=main_lens,
-            **common,
-        )
-    with pytest.raises(ValueError, match="requires a bfloat16 query"):
-        cake.run_cake_dsv4(
-            swa_kv_cache=pool,
-            sparse_topk_lens=None,
-            swa_topk_lens=main_lens,
-            **{**common, "query": torch.zeros((2, 64, 512), dtype=torch.float8_e4m3fn)},
-        )
-    # Dense pools refuse the NVFP4 length name.
-    with pytest.raises(ValueError, match="swa_topk_lens is the NVFP4 route"):
-        cake.run_cake_dsv4(
-            swa_kv_cache=torch.zeros((4, 1, 64, 512), dtype=torch.bfloat16),
-            sparse_topk_lens=main_lens,
-            swa_topk_lens=main_lens,
-            **{
-                **common,
-                "compressed_kv_cache": torch.zeros(
-                    (4, 1, 64, 512), dtype=torch.bfloat16
-                ),
-                "kv_cache_format": "fp8",
-            },
-        )
-    assert recorder.calls == []

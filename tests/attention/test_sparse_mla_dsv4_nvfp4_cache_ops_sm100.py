@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DSV4 NVFP4 cache pack/append on SM100/SM103 and the CAKE NVFP4 gate.
+"""DSV4 NVFP4 cache pack/append on SM100/SM103 and the NVFP4 entry-point split.
 
 The cache writers share one kernel source with the SM120 path; these tests
 pin the bytes they produce on B200/GB300 to the same linear NVFP4 reference
-the SM120 tests use (``_reference_rows``), and check that the public DSv4
-entry point routes ``backend="cake"`` + ``kv_cache_format="nvfp4"`` into the
-CAKE host on CC 10.x while ``backend="sparse"`` still refuses there. The
-attention route itself is covered by ``tests/mla/test_cake_dsv4_nvfp4.py``.
+the SM120 tests use (``_reference_rows``). On CC 10.x the NVFP4 cache has its
+own entry point (:func:`flashinfer.mla.cake_sparse_mla_sm100_dsv4_nvfp4_prefill`,
+covered by ``tests/mla/test_cake_dsv4_nvfp4.py``); the dense-cache DSv4 entry
+point refuses it for every backend.
 """
 
 import pytest
@@ -328,7 +328,7 @@ def test_pack_rejects_wrong_dtype() -> None:
 
 
 def _gate_inputs(num_heads: int = 64, topk: int = 512):
-    """Minimal valid NVFP4 inputs: one request, one query token."""
+    """Minimal valid NVFP4 inputs for the DSv4 trtllm-gen entry point: one request, one token."""
     device = torch.device("cuda")
     torch.manual_seed(3)
     swa = nvfp4_quantize_pack_sparse_mla_cache(
@@ -342,13 +342,7 @@ def _gate_inputs(num_heads: int = 64, topk: int = 512):
     sparse_indices[0] = torch.arange(topk, dtype=torch.int32, device=device)
     swa_topk_lens = torch.tensor([topk], dtype=torch.int32, device=device)
     seq_lens = torch.tensor([128], dtype=torch.int32, device=device)
-    workspace = torch.empty(
-        flashinfer.mla.get_cake_dsv4_workspace_bytes(
-            1, num_heads, topk, torch.bfloat16
-        ),
-        dtype=torch.uint8,
-        device=device,
-    )
+    workspace = torch.empty(1 << 20, dtype=torch.uint8, device=device)
     return dict(
         query=query,
         swa_kv_cache=swa,
@@ -363,36 +357,37 @@ def _gate_inputs(num_heads: int = 64, topk: int = 512):
     )
 
 
-def test_cake_nvfp4_gate_reaches_cake_host() -> None:
-    """The public entry runs the CAKE NVFP4 route on CC 10.x (one token, 64 heads)."""
+def test_sm100_nvfp4_prefill_entry_point_runs() -> None:
+    """The separate NVFP4 entry point runs one token of 64 heads on CC 10.x."""
     _require_sm100_family()
     inputs = _gate_inputs()
-    out = flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(backend="cake", **inputs)
-    torch.cuda.synchronize()
-    assert out.shape == inputs["query"].shape and out.dtype == torch.bfloat16
-    assert torch.isfinite(out.float()).all()
-    lse = flashinfer.mla.cake_dsv4_nvfp4_lse(inputs["workspace_buffer"], 1, 64)
-    assert lse.shape == (1, 64) and torch.isfinite(lse).all()
-
-
-def test_cake_nvfp4_gate_rejects_combined_lengths() -> None:
-    """The NVFP4 main table is not a 128-slot window: sparse_topk_lens is refused."""
-    _require_sm100_family()
-    inputs = _gate_inputs()
-    inputs["sparse_topk_lens"] = inputs.pop("swa_topk_lens")
-    with pytest.raises(ValueError, match="requires swa_topk_lens"):
-        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(backend="cake", **inputs)
-
-
-def test_cake_nvfp4_gate_rejects_dense_pools() -> None:
-    """An NVFP4 request with a dense BF16 pool is a format mismatch, not a route."""
-    _require_sm100_family()
-    inputs = _gate_inputs()
-    inputs["swa_kv_cache"] = torch.randn(
-        2, 1, 64, _D_LATENT, dtype=torch.bfloat16, device="cuda"
+    query = inputs["query"].reshape(64, 1, _D_LATENT)
+    q_nvfp4 = nvfp4_quantize_pack_sparse_mla_cache(query).view(1, 64, _BYTES_PER_TOKEN)
+    out = torch.empty((1, 64, _D_LATENT), dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty((1, 64), dtype=torch.float32, device="cuda")
+    flashinfer.mla.cake_sparse_mla_sm100_dsv4_nvfp4_prefill(
+        q_nvfp4,
+        inputs["swa_kv_cache"],
+        inputs["sparse_indices"],
+        out,
+        lse,
+        _D_LATENT**-0.5,
+        topk_length=inputs["swa_topk_lens"],
     )
-    with pytest.raises(ValueError, match="packed uint8 swa_kv_cache with 384 bytes"):
-        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(backend="cake", **inputs)
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all() and torch.isfinite(lse).all()
+
+
+@pytest.mark.parametrize("backend", ["cake", "auto"])
+def test_dsv4_entry_point_refuses_nvfp4_cache_on_sm100_family(backend: str) -> None:
+    """The dense-cache DSv4 entry point has no NVFP4 route on CC 10.x."""
+    _require_sm100_family()
+    with pytest.raises(
+        ValueError, match="requires backend='sparse'.*or backend='cake'"
+    ):
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            backend=backend, **_gate_inputs()
+        )
 
 
 def test_sparse_backend_still_refuses_sm100_family() -> None:
@@ -400,17 +395,6 @@ def test_sparse_backend_still_refuses_sm100_family() -> None:
     with pytest.raises(ValueError, match="backend='sparse' requires SM120/SM121"):
         flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
             backend="sparse", **_gate_inputs()
-        )
-
-
-def test_auto_backend_nvfp4_still_requires_sparse_or_cake() -> None:
-    """``backend="auto"`` resolves to TRTLLM-GEN on CC 10.x, which has no NVFP4 cache."""
-    _require_sm100_family()
-    with pytest.raises(
-        ValueError, match="requires backend='sparse'.*or backend='cake'"
-    ):
-        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
-            backend="auto", **_gate_inputs()
         )
 
 
@@ -424,23 +408,8 @@ def test_auto_backend_nvfp4_still_requires_sparse_or_cake() -> None:
         (8, "nvfp4_h128_prefill_persistent_thin_heads"),
     ],
 )
-def test_run_cake_dsv4_nvfp4_route_key(num_heads: int, expected: str) -> None:
-    """The routing key selects the epilogue form by head count, independent of a GPU."""
-    from flashinfer.mla.cake_dsv4 import _route
+def test_nvfp4_prefill_route_key(num_heads: int, expected: str) -> None:
+    """The variant is chosen by head count, independent of a GPU."""
+    from flashinfer.mla.cake_dsv4 import _nvfp4_route
 
-    for arch in ("sm_100a", "sm_103a"):
-        assert (
-            _route(
-                arch=arch,
-                dtype=torch.bfloat16,
-                num_heads=num_heads,
-                max_q_len=1,
-                ragged=False,
-                sparse_topk=512,
-                batch_size=1,
-                compressed_page_size=64,
-                num_query_tokens=1,
-                kv_cache_format="nvfp4",
-            )
-            == expected
-        )
+    assert _nvfp4_route(num_heads) == expected

@@ -17,12 +17,14 @@
 Rows: H in {16, 32, 64, 128} x K in {128, 512} x T in {128, 512, 2048, 8192} x
 {single main cache (page 64), dual main + extra cache (page 64, extra top-k = K)}
 as a ragged two-request batch (request lengths linspace(T/2, T)), plus four
-single-request H128 rows (K in {128, 512}, T in {2048, 8192}). Every arm is the
-whole public ``trtllm_batch_decode_sparse_mla_dsv4`` call timed with CUPTI and a
-cold L2 between iterations; the optional baseline arms map the same logical
-BF16 Q / KV / selection / lengths / sink onto the dense-cache CAKE routes
+single-request H128 rows (K in {128, 512}, T in {2048, 8192}). The NVFP4 arm is
+the whole public ``cake_sparse_mla_sm100_dsv4_nvfp4_prefill`` call on a packed
+query, timed with CUPTI and a cold L2 between iterations; the optional baseline
+arms map the same logical BF16 Q / KV / selection / lengths / sink onto the
+dense-cache ``trtllm_batch_decode_sparse_mla_dsv4`` routes of CAKE
 (``--baselines cake-bf16 cake-fp8``) and TRTLLM-GEN (``trtllm-gen-bf16``,
-``trtllm-gen-fp8``). The NVFP4 cache pack time is reported separately.
+``trtllm-gen-fp8``), whose FP8 arms likewise take a pre-cast query. The NVFP4
+cache pack and query pack times are reported separately.
 
 Usage::
 
@@ -40,6 +42,7 @@ import statistics
 import torch
 
 from flashinfer.mla import (
+    cake_sparse_mla_sm100_dsv4_nvfp4_prefill,
     get_cake_dsv4_workspace_bytes,
     nvfp4_quantize_pack_sparse_mla_cache,
     trtllm_batch_decode_sparse_mla_dsv4,
@@ -177,6 +180,15 @@ def median_ms(fn, repeat_time_ms: int):
     )
 
 
+def pack_query(query):
+    """[T, H, 512] BF16 -> [T, H, 384] NVFP4 rows (one-token pages of the cache format)."""
+    tokens, heads = query.shape[:2]
+    packed = nvfp4_quantize_pack_sparse_mla_cache(
+        query.reshape(tokens * heads, 1, HEAD_DIM)
+    )
+    return packed.view(tokens, heads, packed.shape[-1])
+
+
 def nvfp4_call(inputs):
     main_cache = nvfp4_quantize_pack_sparse_mla_cache(inputs["main_latent"])
     extra_cache = (
@@ -184,36 +196,35 @@ def nvfp4_call(inputs):
         if inputs["extra_latent"] is not None
         else None
     )
+    query = pack_query(inputs["query"])
     out = torch.empty_like(inputs["query"])
+    lse = torch.empty(inputs["query"].shape[:2], dtype=torch.float32, device=out.device)
 
     def call():
-        return trtllm_batch_decode_sparse_mla_dsv4(
-            inputs["query"],
+        cake_sparse_mla_sm100_dsv4_nvfp4_prefill(
+            query,
             main_cache,
-            inputs["workspace"],
             inputs["main_idx"],
-            compressed_kv_cache=extra_cache,
-            swa_topk_lens=inputs["main_lens"],
-            extra_sparse_indices=inputs["extra_idx"],
-            extra_sparse_topk_lens=inputs["extra_lens"],
-            seq_lens=inputs["seq_lens"],
-            out=out,
-            bmm1_scale=SCALE,
-            bmm2_scale=1.0,
-            sinks=inputs["sinks"],
-            cum_seq_lens_q=inputs["cum_seq_lens_q"],
-            max_q_len=inputs["max_q_len"],
-            enable_pdl=False,
-            backend="cake",
-            kv_cache_format="nvfp4",
+            out,
+            lse,
+            SCALE,
+            topk_length=inputs["main_lens"],
+            attn_sink=inputs["sinks"],
+            extra_kv_cache=extra_cache,
+            extra_indices=inputs["extra_idx"],
+            extra_topk_length=inputs["extra_lens"],
         )
 
     def pack():
         nvfp4_quantize_pack_sparse_mla_cache(inputs["main_latent"])
 
+    def qpack():
+        pack_query(inputs["query"])
+
     return (
         call,
         pack,
+        qpack,
         main_cache.numel() + (extra_cache.numel() if extra_cache is not None else 0),
     )
 
@@ -302,18 +313,18 @@ def main():
     device = torch.device("cuda")
     major, _ = torch.cuda.get_device_capability(device)
     if major != 10:
-        raise SystemExit("the CAKE DSv4 NVFP4 route requires SM100/SM103")
+        raise SystemExit("the CAKE DSv4 NVFP4 prefill requires SM100/SM103")
     selected = [row for row in rows() if re.search(args.rows, row["name"])]
     arms = ["cake-nvfp4", *args.baselines]
     print(
         f"{'row':34s} {'tokens':>6s} "
         + " ".join(f"{arm:>16s}" for arm in arms)
-        + f" {'pack_ms':>8s} {'cache_MiB':>9s}"
+        + f" {'pack_us':>8s} {'qpack_us':>8s} {'cache_MiB':>9s}"
     )
     results = []
     for row in selected:
         inputs = make_inputs(row, device)
-        call, pack, cache_bytes = nvfp4_call(inputs)
+        call, pack, qpack, cache_bytes = nvfp4_call(inputs)
         call()
         torch.cuda.synchronize()
         record = dict(
@@ -321,6 +332,7 @@ def main():
         )
         record["arms"]["cake-nvfp4"] = median_ms(call, args.repeat_ms)
         record["pack_ms"] = median_ms(pack, args.repeat_ms)
+        record["qpack_ms"] = median_ms(qpack, args.repeat_ms)
         for arm in args.baselines:
             dtype, backend = BASELINES[arm]
             try:
@@ -347,7 +359,8 @@ def main():
         print(
             f"{row['name']:34s} {inputs['tokens']:6d} "
             + " ".join(cells)
-            + f" {record['pack_ms'] * 1000:8.1f} {cache_bytes / 2**20:9.1f}"
+            + f" {record['pack_ms'] * 1000:8.1f} {record['qpack_ms'] * 1000:8.1f}"
+            + f" {cache_bytes / 2**20:9.1f}"
         )
         results.append(record)
         del inputs
