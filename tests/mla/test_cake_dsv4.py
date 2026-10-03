@@ -2379,6 +2379,16 @@ _NVFP4_PLAN = _plan(
     ("parameter", "compressed_width"),
     ("buffer", "extra_topk_lens"),
 )
+# The single-CTA body (num_heads <= 64): no TMA-store epilogue map, no work-item scalars.
+_NVFP4_H64_PLAN = _plan(
+    *(
+        entry
+        for entry in _NVFP4_PLAN
+        if entry[1]
+        not in ("tmap_o", "sparse_topk", "total_work_items", "max_q_len")
+        and entry[0] != "grid"
+    )
+)
 _NVFP4_BYTES = 384
 
 
@@ -2394,13 +2404,12 @@ def test_nvfp4_vocabulary_is_bindable():
         cake.canonical_arg_name("tma_buffer", "tmap_compressed_sf")
         == "compressed_KV_sf"
     )
-    assert (
-        cake._nvfp4_route(128)
-        == cake._nvfp4_route(64)
-        == "nvfp4_h128_prefill_persistent"
-    )
-    for heads in (8, 16, 32):
-        assert cake._nvfp4_route(heads) == "nvfp4_h128_prefill_persistent_thin_heads"
+    assert cake._nvfp4_route(128) == "nvfp4_h128_prefill_persistent"
+    assert cake._nvfp4_route(96) == "nvfp4_h128_prefill_persistent_thin_heads"
+    for heads in (8, 16, 32, 64):
+        assert cake._nvfp4_route(heads) == "nvfp4_h64_prefill_persistent"
+        assert cake._nvfp4_ctas_per_token(heads) == 1
+    assert cake._nvfp4_ctas_per_token(96) == cake._nvfp4_ctas_per_token(128) == 2
 
 
 def _nvfp4_pool(
@@ -2575,7 +2584,8 @@ def _run_fake_nvfp4(
     offset=0,
 ):
     route = cake._nvfp4_route(num_heads)
-    recorder = _install_fake_variants(monkeypatch, {route: _NVFP4_PLAN})
+    plan = _NVFP4_H64_PLAN if route == "nvfp4_h64_prefill_persistent" else _NVFP4_PLAN
+    recorder = _install_fake_variants(monkeypatch, {route: plan})
     monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
     main, main_lens, extra, extra_lens_tensor = _nvfp4_tables(
         rows, main_width, extra_width
@@ -2603,7 +2613,7 @@ def _run_fake_nvfp4(
         extra_topk_length=extra_lens_tensor if extra_lens else None,
     )
     (call,) = recorder.calls
-    bound = dict(zip((name for _, name in _NVFP4_PLAN), call, strict=True))
+    bound = dict(zip((name for _, name in plan), call, strict=True))
     env = dict(
         query=query,
         out=out,
@@ -2666,18 +2676,29 @@ def test_nvfp4_prefill_binds_query_pools_segments_and_lse(monkeypatch):
     assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (2 * rows, 1, 1)
 
 
-@pytest.mark.parametrize("num_heads", [8, 16, 32])
-def test_nvfp4_prefill_thin_heads_variant(monkeypatch, num_heads):
-    bound, env = _run_fake_nvfp4(
-        monkeypatch, num_heads=num_heads, rows=3, main_width=512
-    )
+def test_nvfp4_prefill_thin_heads_variant(monkeypatch):
+    bound, env = _run_fake_nvfp4(monkeypatch, num_heads=96, rows=3, main_width=512)
     assert env["route"] == "nvfp4_h128_prefill_persistent_thin_heads"
-    assert bound["num_heads"] == num_heads
+    assert bound["num_heads"] == 96
+    assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (6, 1, 1)
+
+
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 64])
+def test_nvfp4_prefill_single_cta_variant(monkeypatch, num_heads):
+    bound, env = _run_fake_nvfp4(
+        monkeypatch, num_heads=num_heads, rows=3, main_width=512, extra_width=128
+    )
+    assert env["route"] == "nvfp4_h64_prefill_persistent"
+    assert bound["num_heads"] == num_heads and bound["num_query_tokens"] == 3
+    assert bound["O"] is env["out"] and bound["LSE"] is env["lse"]
+    assert bound["swa_width"] == 512 and bound["compressed_width"] == 128
+    # One CTA per query token.
+    assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (3, 1, 1)
 
 
 def test_nvfp4_prefill_single_pool(monkeypatch):
     bound, env = _run_fake_nvfp4(
-        monkeypatch, num_heads=64, rows=4, main_width=512, sinks=False, offset=-96
+        monkeypatch, num_heads=128, rows=4, main_width=512, sinks=False, offset=-96
     )
     main_geo = cake.nvfp4_pool_geometry(env["main_cache"], "kv_cache")
     # The compressed descriptors alias the main pool; the extra table aliases the main table.

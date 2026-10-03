@@ -19,13 +19,15 @@ SM120 NVFP4 entry points: `indices [T, K_main]` indexes the main pool with
 active lengths `topk_length [T]`, `extra_indices [T, K_extra]` indexes the
 compressed pool with independent `extra_topk_length [T]`, `-1` entries are
 masked, and rows with no valid entry produce zeros (and `-inf` LSE without a
-sink). One persistent two-CTA body serves every head count up to 128; head
-counts that are not a multiple of 64 run its plain-store epilogue variant
+sink). Up to 64 heads run a persistent single-CTA body (one CTA per query
+token, `nvfp4_h64_prefill_persistent`, KV tiles of 64 slots); 65 to 128 heads
+run a persistent two-CTA body (KV tiles of 128 slots), whose head counts that
+are not a multiple of 64 use its plain-store epilogue variant
 (`nvfp4_h128_prefill_persistent_thin_heads`). `output` and the base-2 `out_lse`
 are caller-owned; the call allocates nothing and needs no workspace. P is
-accumulated in FP32 and the online softmax order is fixed (one KV tile of 128
-slots at a time, main segment first); the P operand of PV is E4M3, the same
-precision as the SM120 NVFP4 route.
+accumulated in FP32 and the online softmax order is fixed (one KV tile at a
+time, main segment first); the P operand of PV is E4M3, the same precision as
+the SM120 NVFP4 route.
 
 ```python
 from flashinfer.mla import (

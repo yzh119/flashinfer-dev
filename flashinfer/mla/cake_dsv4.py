@@ -1275,18 +1275,28 @@ def _full_lens(rows: int, value: int, *, device: torch.device) -> torch.Tensor:
     return result
 
 
+_NVFP4_H64_ROUTE = "nvfp4_h64_prefill_persistent"
+_NVFP4_H64_MAX_HEADS = 64
 _NVFP4_ROUTE = "nvfp4_h128_prefill_persistent"
 _NVFP4_THIN_HEADS_ROUTE = _NVFP4_ROUTE + "_thin_heads"
 _NVFP4_TMA_STORE_HEAD_MULTIPLE = 64
 
 
 def _nvfp4_route(num_heads: int) -> str:
-    """The NVFP4 variant for ``num_heads`` (the Cake seed's ``variant_alias_for_heads``)."""
+    """The NVFP4 variant for ``num_heads``: the single-CTA body up to 64 heads, the
+    two-CTA H128 body (TMA-store or thin-heads epilogue) above."""
+    if num_heads <= _NVFP4_H64_MAX_HEADS:
+        return _NVFP4_H64_ROUTE
     return (
         _NVFP4_ROUTE
         if num_heads % _NVFP4_TMA_STORE_HEAD_MULTIPLE == 0
         else _NVFP4_THIN_HEADS_ROUTE
     )
+
+
+def _nvfp4_ctas_per_token(num_heads: int) -> int:
+    """CTAs launched per query token by the NVFP4 variant of ``num_heads``."""
+    return 1 if num_heads <= _NVFP4_H64_MAX_HEADS else 2
 
 
 def cake_sparse_mla_sm100_dsv4_nvfp4_prefill(
@@ -1312,9 +1322,10 @@ def cake_sparse_mla_sm100_dsv4_nvfp4_prefill(
     dims as packed E2M1 with one E4M3 scale per 16 values and the 64 RoPE dims
     in BF16, 384 bytes per row. QK runs block-scaled FP4 on the NoPE dims and
     BF16 on the RoPE dims; PV runs FP8 on V dequantised in-kernel. Each query
-    token is one work item of a persistent two-CTA body that attends its own
-    selected main (and optional extra) KV rows. Writes ``output`` and
-    ``out_lse`` in place.
+    token is one work item of a persistent body (one CTA per token up to 64
+    heads, a two-CTA cluster per token above) that attends its own selected
+    main (and optional extra) KV rows. Writes ``output`` and ``out_lse`` in
+    place.
 
     Parameters
     ----------
@@ -1484,12 +1495,12 @@ def cake_sparse_mla_sm100_dsv4_nvfp4_prefill(
         "compressed_pitch_units": extra_pool.pitch_units,
         "compressed_footer_units": extra_pool.footer_units,
     }
-    # One persistent two-CTA cluster per query token (cluster launch control
-    # feeds the work items).
+    # One persistent CTA (up to 64 heads) or two-CTA cluster per query token
+    # (cluster launch control feeds the work items).
     _launch_variant(
         _nvfp4_route(num_heads),
         arch=arch,
-        grid=(num_tokens * 2, 1, 1),
+        grid=(num_tokens * _nvfp4_ctas_per_token(num_heads), 1, 1),
         workspace_raw=None,
         values=values,
     )
