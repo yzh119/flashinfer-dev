@@ -128,6 +128,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_KMAX_STRIDE 32
 #define SMEM_TOTAL 226304
 #define THREADS 640
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -396,8 +397,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(640, 1) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_8430d712d502f5c4e1ed(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_q_sf, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_swa_sf, const __grid_constant__ CUtensorMap tmap_compressed_sf, const __grid_constant__ CUtensorMap tmap_o, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int max_q_len, int swa_page_log2, int swa_pitch_units, int swa_footer_units, int compressed_page_log2, int compressed_pitch_units, int compressed_footer_units, int swa_width, int compressed_width, int* __restrict__ extra_topk_lens)
+__global__ __launch_bounds__(640, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_dsv4_2af36db8d515fdfd1a14(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_q_sf, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_swa_sf, const __grid_constant__ CUtensorMap tmap_compressed_sf, const __grid_constant__ CUtensorMap tmap_o, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int max_q_len, int swa_page_log2, int swa_pitch_units, int swa_footer_units, int compressed_page_log2, int compressed_pitch_units, int compressed_footer_units, int swa_width, int compressed_width, int* __restrict__ extra_topk_lens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1037,37 +1038,37 @@ kernel_cake_dsv4_8430d712d502f5c4e1ed(const __grid_constant__ CUtensorMap tmap_q
                                 unsigned int v_sc = ((v_w < 2) ? v_sc0 : v_sc1);
                                 unsigned int v_word = v_cur[v_w];
                                 uint32_t _e2m1_to_f16x2_0;
-                                asm("{ .reg .b8 _b, _z;                    \n\t"
-                "  mov.b16 {_b, _z}, %1;                \n\t"
+                                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-                : "=r"(_e2m1_to_f16x2_0) : "h"((uint16_t)(v_word)));
+                : "=r"(_e2m1_to_f16x2_0) : "r"((uint32_t)(v_word)));
                                 uint32_t _f16x2_scaled_0;
                                 asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(_f16x2_scaled_0) : "r"(_e2m1_to_f16x2_0), "r"(v_sc));
                                 uint16_t _e4m3x2_0;
                                 asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(_e4m3x2_0) : "r"(_f16x2_scaled_0));
                                 uint32_t _e2m1_to_f16x2_1;
-                                asm("{ .reg .b8 _b, _z;                    \n\t"
-                "  mov.b16 {_b, _z}, %1;                \n\t"
+                                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-                : "=r"(_e2m1_to_f16x2_1) : "h"((uint16_t)(v_word >> 8)));
+                : "=r"(_e2m1_to_f16x2_1) : "r"((uint32_t)(v_word >> 8)));
                                 uint32_t _f16x2_scaled_1;
                                 asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(_f16x2_scaled_1) : "r"(_e2m1_to_f16x2_1), "r"(v_sc));
                                 uint16_t _e4m3x2_1;
                                 asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(_e4m3x2_1) : "r"(_f16x2_scaled_1));
                                 uint32_t _e2m1_to_f16x2_2;
-                                asm("{ .reg .b8 _b, _z;                    \n\t"
-                "  mov.b16 {_b, _z}, %1;                \n\t"
+                                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-                : "=r"(_e2m1_to_f16x2_2) : "h"((uint16_t)(v_word >> 16)));
+                : "=r"(_e2m1_to_f16x2_2) : "r"((uint32_t)(v_word >> 16)));
                                 uint32_t _f16x2_scaled_2;
                                 asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(_f16x2_scaled_2) : "r"(_e2m1_to_f16x2_2), "r"(v_sc));
                                 uint16_t _e4m3x2_2;
                                 asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(_e4m3x2_2) : "r"(_f16x2_scaled_2));
                                 uint32_t _e2m1_to_f16x2_3;
-                                asm("{ .reg .b8 _b, _z;                    \n\t"
-                "  mov.b16 {_b, _z}, %1;                \n\t"
+                                asm("{ .reg .b8 _b;                        \n\t"
+                "  mov.b32 {_b, _, _, _}, %1;           \n\t"
                 "  cvt.rn.f16x2.e2m1x2 %0, _b;         }"
-                : "=r"(_e2m1_to_f16x2_3) : "h"((uint16_t)(v_word >> 24)));
+                : "=r"(_e2m1_to_f16x2_3) : "r"((uint32_t)(v_word >> 24)));
                                 uint32_t _f16x2_scaled_3;
                                 asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(_f16x2_scaled_3) : "r"(_e2m1_to_f16x2_3), "r"(v_sc));
                                 uint16_t _e4m3x2_3;
