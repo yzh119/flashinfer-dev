@@ -51,9 +51,11 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+import numpy as np
 import torch
 import tvm_ffi
 
+from ...utils import get_compute_capability, get_device_sm_count
 from .cake_jit import ARG_PLANS, FFI_ENTRY, load_program, select_program
 
 LATENT = 512
@@ -89,7 +91,8 @@ WORKSPACE_ALIGNMENT = 16
 
 # Keyword names the stages are bound with (the registry's argument plans refer
 # to these names; ``_bind_stage`` orders them by the generated argument plan).
-# ``tmap_po`` is the wide kernel's alone: the row-tile programs' plans do not name it.
+# ``tmap_po`` is the wide kernel's alone (the row-tile programs' plans do not name it); ``warps_per_row`` is the
+# warp reducer's alone: it selects the compiled instantiation of that program (the CTA reducer has no such argument).
 MAIN_KWARGS = (
     "tmap_qn",
     "tmap_qs",
@@ -131,6 +134,7 @@ REDUCE_KWARGS = (
     "bmm2_scale",
     "lse_bias",
     "has_lse",
+    "warps_per_row",
     "grid",
 )
 QUANTIZE_KWARGS = (
@@ -212,8 +216,10 @@ class DecodePlan:
     grid_main: tuple[
         int, int, int
     ]  # wide route: 2 * num_split CTAs along x (one cluster per split)
-    reduce_kind: str  # "reduce_w4" / "reduce_w2" / "reduce_w1" / "reduce_cta"; unused when num_split == 1
-    reduce_warps: int  # 0 for the CTA reducer
+    # "reduce_warp" / "reduce_cta"; unused when num_split == 1
+    reduce_kind: str
+    # warps per row of the warp reducer (1, 2 or 4); 0 for the CTA reducer
+    reduce_warps: int
     grid_reduce: tuple[int, int, int]
     wide: bool = False
     wide_clusters: int = (
@@ -282,7 +288,7 @@ def plan_mla_nvfp4_paged_decode(
         grid_reduce = (rows_max, REDUCE_DIM_CHUNKS, 1)
     else:
         reduce_warps = reduce_warps_per_row(rows_max)
-        reduce_kind = f"reduce_w{reduce_warps}"
+        reduce_kind = "reduce_warp"
         rows_per_cta = REDUCE_WARPS // reduce_warps
         grid_reduce = ((rows_max + rows_per_cta - 1) // rows_per_cta, 1, 1)
     return DecodePlan(
@@ -359,15 +365,16 @@ def _device_index(device: torch.device) -> int:
 
 @functools.cache
 def _device_facts(device_index: int) -> tuple[str, int]:
-    """``(arch, sm_count)`` of a device, read once per process."""
-    props = torch.cuda.get_device_properties(device_index)
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get((props.major, props.minor))
+    """``(arch, sm_count)`` of a device, read once per process through FlashInfer's cached device queries."""
+    device = torch.device("cuda", device_index)
+    capability = get_compute_capability(device)
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
     if arch is None:
         raise ValueError(
             "Cake NVFP4 MLA decode requires compute capability 10.0 or 10.3 "
-            f"(got {props.major}.{props.minor})"
+            f"(got {capability[0]}.{capability[1]})"
         )
-    return arch, int(props.multi_processor_count)
+    return arch, int(get_device_sm_count(device))
 
 
 _DENSE_Q_INDPTR: dict[tuple[int, int, int], torch.Tensor] = {}
@@ -434,24 +441,49 @@ def _check_cache(name: str, t: torch.Tensor, width: int, dtype) -> None:
 def query_scale_constants(ckv_scale: float, kpe_scale: float) -> tuple[float, float]:
     """``(c_nope, c_rope)`` of the quantizer in float32 arithmetic: ``1 / (6 * 448)`` and
     ``kpe_scale * (1 / (448 * ckv_scale))``."""
-    f32 = torch.float32
-    c_nope = torch.tensor(1.0 / (E2M1_MAX * E4M3_MAX), dtype=f32)
-    c_rope = torch.tensor(kpe_scale, dtype=f32) * (
-        torch.tensor(1.0, dtype=f32) / torch.tensor(E4M3_MAX * ckv_scale, dtype=f32)
-    )
+    f32 = np.float32
+    c_nope = f32(1.0 / (E2M1_MAX * E4M3_MAX))
+    c_rope = f32(kpe_scale) * (f32(1.0) / f32(E4M3_MAX * ckv_scale))
     return float(c_nope), float(c_rope)
 
 
+# q_nope + q_sf + q_rope + q_scale per query row
+_QUERY_ROW_BYTES = CKV_BYTES + SF_BYTES + ROPE + 4
+
+
+def query_workspace_bytes(rows: int) -> int:
+    """Bytes of the caller-owned uint8 buffer :func:`mla_nvfp4_query_buffers` carves for ``rows`` query rows."""
+    return rows * _QUERY_ROW_BYTES
+
+
 def mla_nvfp4_query_buffers(
-    lead: tuple[int, ...], device: torch.device
+    workspace: torch.Tensor, lead: tuple[int, ...]
 ) -> tuple[torch.Tensor, ...]:
-    """Fresh ``(q_nope, q_sf, q_rope, q_scale)`` buffers for query rows of leading shape ``lead``."""
-    return (
-        torch.empty((*lead, CKV_BYTES), dtype=torch.uint8, device=device),
-        torch.empty((*lead, SF_BYTES), dtype=torch.float8_e4m3fn, device=device),
-        torch.empty((*lead, ROPE), dtype=torch.float8_e4m3fn, device=device),
-        torch.empty(lead, dtype=torch.float32, device=device),
-    )
+    """``(q_nope, q_sf, q_rope, q_scale)`` views of the caller's uint8 CUDA ``workspace`` for query rows of
+    leading shape ``lead`` (at least ``query_workspace_bytes(prod(lead))`` bytes; nothing is allocated)."""
+    rows = math.prod(lead)
+    if (
+        workspace.device.type != "cuda"
+        or workspace.dtype != torch.uint8
+        or not workspace.is_contiguous()
+    ):
+        raise ValueError("the query workspace must be a contiguous uint8 CUDA tensor")
+    raw = workspace.reshape(-1)
+    if raw.numel() < query_workspace_bytes(rows):
+        raise ValueError(
+            f"the query workspace needs at least {query_workspace_bytes(rows)} bytes for {rows} rows, got {raw.numel()}"
+        )
+    off = 0
+    views = []
+    for width, dtype in (
+        (CKV_BYTES, torch.uint8),
+        (SF_BYTES, torch.float8_e4m3fn),
+        (ROPE, torch.float8_e4m3fn),
+    ):
+        views.append(raw[off : off + rows * width].view(dtype).view(*lead, width))
+        off += rows * width
+    views.append(raw[off : off + rows * 4].view(torch.float32).view(lead))
+    return tuple(views)
 
 
 class CakeMlaNvfp4QueryQuantize:
@@ -459,7 +491,7 @@ class CakeMlaNvfp4QueryQuantize:
 
     ``query`` is a contiguous BF16 tensor ``[.., 576]`` (512 latent + 64 rope channels per
     (token, head) row after the up-projection / absorption); ``out`` holds the four query
-    operands of :class:`CakeMlaNvfp4PagedDecode` (``mla_nvfp4_query_buffers`` allocates them).
+    operands of :class:`CakeMlaNvfp4PagedDecode` (``mla_nvfp4_query_buffers`` carves them from a caller workspace).
     Per row ``q_scale = max(amax(nope) / (6 * 448), amax(rope) * kpe_scale / (448 * ckv_scale))``
     (1 for an all-zero row), per 16-channel block ``sf = e4m3(amax_block / (6 q_scale))`` and
     ``codes = e2m1(x / (sf q_scale))``, rope ``e4m3(x * kpe_scale / (q_scale * ckv_scale))``.
@@ -544,9 +576,13 @@ def quantize_mla_nvfp4_query(
     *,
     out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One-shot query quantization: ``(q_nope, q_sf, q_rope, q_scale)`` of a BF16 query ``[.., 576]``."""
+    """One-shot query quantization: ``(q_nope, q_sf, q_rope, q_scale)`` of a BF16 query ``[.., 576]`` into the
+    caller-owned ``out`` (``mla_nvfp4_query_buffers`` carves it from a workspace)."""
     if out is None:
-        out = mla_nvfp4_query_buffers(tuple(query.shape[:-1]), query.device)
+        raise ValueError(
+            "out is required: the caller owns the query buffers (mla_nvfp4_query_buffers carves them from a "
+            "uint8 workspace of query_workspace_bytes(rows) bytes)"
+        )
     return CakeMlaNvfp4QueryQuantize(
         query=query, ckv_scale=ckv_scale, kpe_scale=kpe_scale, out=out
     ).launch()
@@ -812,7 +848,10 @@ class CakeMlaNvfp4PagedDecode:
         )
         assert tuple(main_kwargs) == MAIN_KWARGS
         self._main_entry, self._main_arguments = _bind_stage(
-            "main_wide" if plan.main_kind == "main_wide" else "main", self.main_program, self.arch, main_kwargs
+            "main_wide" if plan.main_kind == "main_wide" else "main",
+            self.main_program,
+            self.arch,
+            main_kwargs,
         )
         self._reduce_entry: Optional[Callable[..., Any]] = None
         self._reduce_arguments: tuple = ()
@@ -830,11 +869,15 @@ class CakeMlaNvfp4PagedDecode:
                 bmm2_scale=self.bmm2_scale,
                 lse_bias=plan.lse_bias,
                 has_lse=has_lse,
+                warps_per_row=plan.reduce_warps,
                 grid=plan.grid_reduce,
             )
             assert tuple(reduce_kwargs) == REDUCE_KWARGS
             self._reduce_entry, self._reduce_arguments = _bind_stage(
-                "reduce", self.reduce_program, self.arch, reduce_kwargs
+                "reduce_warp" if plan.reduce_kind == "reduce_warp" else "reduce",
+                self.reduce_program,
+                self.arch,
+                reduce_kwargs,
             )
         self.route_metadata = dict(
             backend="cake",
@@ -890,19 +933,16 @@ def cake_mla_nvfp4_paged_decode(
     kv_len_global: Optional[torch.Tensor] = None,
     backend: str = "cake",
 ):
-    """One-shot dense NVFP4 MLA decode (prepare + one launch).
-
-    Allocates ``out`` (and ``lse`` with ``return_lse=True``) when not given; the plan is
-    cached per batch shape and the device facts per device.  Returns ``out`` or
-    ``(out, lse)``.  Use :class:`CakeMlaNvfp4PagedDecode` for a launch-only runner.
+    """One-shot dense NVFP4 MLA decode (prepare + one launch) into the caller-owned ``out`` (and ``lse``
+    with ``return_lse=True``); the plan is cached per batch shape and the device facts per device.
+    Returns ``out`` or ``(out, lse)``.  Use :class:`CakeMlaNvfp4PagedDecode` for a launch-only runner.
     """
     if backend != "cake":
         raise ValueError("Cake NVFP4 MLA decode supports backend='cake'")
-    lead = tuple(q_nope.shape[:-1])
-    if out is None:
-        out = torch.empty((*lead, V_DIM), dtype=torch.bfloat16, device=q_nope.device)
-    if return_lse and lse is None:
-        lse = torch.empty(lead, dtype=torch.float32, device=q_nope.device)
+    if out is None or (return_lse and lse is None):
+        raise ValueError(
+            "out (and lse with return_lse=True) are required: the caller owns the result buffers"
+        )
     runner = CakeMlaNvfp4PagedDecode(
         q_nope=q_nope,
         q_sf=q_sf,
@@ -953,6 +993,7 @@ __all__ = [
     "cake_mla_nvfp4_paged_decode",
     "max_workspace_bytes",
     "mla_nvfp4_query_buffers",
+    "query_workspace_bytes",
     "plan_mla_nvfp4_paged_decode",
     "plan_num_split",
     "quantize_mla_nvfp4_query",

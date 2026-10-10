@@ -32,6 +32,7 @@ from flashinfer.experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
     CKV_BYTES,
     LSE_BIAS,
     MAIN_KWARGS,
+    REDUCE_KWARGS,
     MAX_SPLITS,
     QK_DIM,
     ROPE,
@@ -47,6 +48,7 @@ from flashinfer.experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
     cake_mla_nvfp4_paged_decode,
     max_workspace_bytes,
     mla_nvfp4_query_buffers,
+    query_workspace_bytes,
     plan_mla_nvfp4_paged_decode,
     quantize_mla_nvfp4_query,
     rt_for_rows,
@@ -565,6 +567,75 @@ def test_cta_reducer_many_splits():
     _check_lse(lse, ref_lse)
 
 
+@pytest.mark.parametrize(
+    "warps,num_heads,q_lens,kv_lens,num_split",
+    [
+        (4, 12, [1, 1, 1], [3000, 2000, 2500], 4),  # 36 rows
+        (2, 96, [1] * 8, [300] * 8, 3),  # 768 rows, the wide route
+        (1, 128, [1] * 17, [200] * 17, 2),  # 2176 rows
+    ],
+)
+def test_warp_reducer_instantiations(warps, num_heads, q_lens, kv_lens, num_split):
+    # One compiled template, three instantiations selected by the launcher's warps_per_row argument.
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _make_case(
+        q_lens, kv_lens, num_heads, seed=625035 + warps, device=device, return_lse=True
+    )
+    out, lse, runner = _run(case, dense_q_len=1, num_split=num_split)
+    assert (
+        runner.plan.reduce_kind == "reduce_warp" and runner.plan.reduce_warps == warps
+    )
+    assert runner.num_split == num_split
+    ref, ref_lse = _reference(case)
+    _check(out, ref)
+    _check_lse(lse, ref_lse)
+
+
+def test_result_and_query_buffers_are_caller_owned():
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _make_case([1], [128], 12, seed=625036, device=device)
+    with pytest.raises(ValueError, match="out is required"):
+        quantize_mla_nvfp4_query(case["q_bf16"], case["ckv_scale"], case["kpe_scale"])
+    workspace = torch.zeros(
+        query_workspace_bytes(12) - 1, dtype=torch.uint8, device=device
+    )
+    with pytest.raises(ValueError, match="query workspace needs at least"):
+        mla_nvfp4_query_buffers(workspace, (1, 12))
+    with pytest.raises(ValueError, match="out .* required"):
+        cake_mla_nvfp4_paged_decode(
+            case["q_nope"],
+            case["q_sf"],
+            case["q_rope"],
+            case["q_scale"],
+            case["ckv_cache"],
+            case["ckv_sf_cache"],
+            case["kpe_cache"],
+            case["block_tables"],
+            case["seq_lens"],
+            _workspace(case, device),
+            sm_scale=SM_SCALE,
+            ckv_scale=case["ckv_scale"],
+        )
+
+
+def test_argument_plans_name_the_programs_extra_operands():
+    # The wide kernel alone takes tmap_po, the warp reducer alone warps_per_row.
+    names = {
+        role: [name for _kind, name in plan]
+        for role, plan in cake_jit.ARG_PLANS.items()
+    }
+    assert "tmap_po" in names["main_wide"] and "tmap_po" not in names["main"]
+    assert [n for n in names["main_wide"] if n != "tmap_po"] == names["main"]
+    assert (
+        "warps_per_row" in names["reduce_warp"]
+        and "warps_per_row" not in names["reduce"]
+    )
+    assert [n for n in names["reduce_warp"] if n != "warps_per_row"] == names["reduce"]
+    assert "tmap_po" in MAIN_KWARGS and "warps_per_row" in REDUCE_KWARGS
+
+
 def test_query_quantizer_matches_reference_bitwise():
     _skip_unless_supported()
     device = torch.device("cuda")
@@ -574,7 +645,15 @@ def test_query_quantizer_matches_reference_bitwise():
             torch.bfloat16
         )
         q[3, 2] = 0.0  # all-zero row: q_scale 1, zero codes / scales
-        got = quantize_mla_nvfp4_query(q, ckv_scale, kpe_scale)
+        query_workspace = torch.zeros(
+            query_workspace_bytes(rows * 12), dtype=torch.uint8, device=device
+        )
+        got = quantize_mla_nvfp4_query(
+            q,
+            ckv_scale,
+            kpe_scale,
+            out=mla_nvfp4_query_buffers(query_workspace, (rows, 12)),
+        )
         want = _quantize_query_reference(q, ckv_scale, kpe_scale)
         for g, w in zip(got, want, strict=True):
             assert g.shape == w.shape and g.dtype == w.dtype
@@ -590,7 +669,10 @@ def test_complete_call_bf16_query():
     case = _make_case([1, 1], [1000, 2000], 12, seed=625041, device=device)
     batch = 2
     q = case["q_bf16"].reshape(batch, 1, 12, QK_DIM)
-    buffers = mla_nvfp4_query_buffers((batch, 1, 12), device)
+    query_workspace = torch.zeros(
+        query_workspace_bytes(batch * 12), dtype=torch.uint8, device=device
+    )
+    buffers = mla_nvfp4_query_buffers(query_workspace, (batch, 1, 12))
     quantizer = CakeMlaNvfp4QueryQuantize(
         query=q, ckv_scale=case["ckv_scale"], kpe_scale=case["kpe_scale"], out=buffers
     )
@@ -608,6 +690,7 @@ def test_complete_call_bf16_query():
         _workspace(case, device),
         sm_scale=SM_SCALE,
         ckv_scale=case["ckv_scale"],
+        out=torch.empty((batch, 1, 12, LATENT), dtype=torch.bfloat16, device=device),
     )
     torch.cuda.synchronize()
     ref, _ = _reference(case)
@@ -700,18 +783,7 @@ def test_every_kernel_key_resolves_on_the_running_architecture():
         # Only the attention programs (hardware QMUL4 through PTX ISA 9.4) carry the toolkit floor.
         assert (record.get("min_cuda_version") == "13.4") == key.startswith("main_")
     assert {f"main_rt{rt}" for rt in ROW_TILES} | {"main_wide"} <= set(cake_jit.KERNELS)
-    assert {"reduce_w1", "reduce_w2", "reduce_w4", "reduce_cta", "quantize"} <= set(
-        cake_jit.KERNELS
-    )
-
-
-def test_wide_argument_plan_carries_the_partial_o_tensor_map():
-    # The wide kernel's epilogue stores through ``tmap_po``; the row-tile kernels do not take it.
-    wide = [name for _kind, name in cake_jit.ARG_PLANS["main_wide"]]
-    narrow = [name for _kind, name in cake_jit.ARG_PLANS["main"]]
-    assert "tmap_po" in wide and "tmap_po" not in narrow
-    assert [n for n in wide if n != "tmap_po"] == narrow
-    assert "tmap_po" in MAIN_KWARGS
+    assert {"reduce_warp", "reduce_cta", "quantize"} <= set(cake_jit.KERNELS)
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +854,11 @@ def test_plan_invariants(sm_count):
                         1,
                     )
                 else:
-                    assert plan.reduce_kind == f"reduce_w{plan.reduce_warps}"
+                    assert plan.reduce_kind == "reduce_warp" and plan.reduce_warps in (
+                        1,
+                        2,
+                        4,
+                    )
                     assert (
                         plan.grid_reduce[0] * (8 // plan.reduce_warps) >= plan.rows_max
                     )
@@ -795,7 +871,11 @@ def test_plan_invariants(sm_count):
     assert cached is plan_mla_nvfp4_paged_decode(
         batch=8, max_q_len=1, num_heads=12, max_seq_len=342305, sm_count=152
     )
-    assert cached.num_split == 19 and cached.reduce_kind == "reduce_w4"
+    assert (
+        cached.num_split == 19
+        and cached.reduce_kind == "reduce_warp"
+        and cached.reduce_warps == 4
+    )
     # Packed variable-length queries: the partials and the merge grid follow the rows the query holds.
     ragged = plan_mla_nvfp4_paged_decode(
         batch=3, max_q_len=8, num_heads=12, max_seq_len=4096, sm_count=152, rows=13 * 12

@@ -35,7 +35,12 @@ may be strided views of one allocation (for example the 352-byte-per-token
 `[.., 256 | 64 | 32]` buffer); token / page strides and the base must be 16-byte
 multiples. `workspace_buffer` is a caller-owned uint8 buffer of at least
 `cake_backend.workspace_bytes(rows, num_split)` bytes
-(`max_workspace_bytes(rows)` covers every plan of a row count).
+(`max_workspace_bytes(rows)` covers every plan of a row count). Every buffer
+the calls write is caller-owned and nothing is allocated per call: `out` (and
+`lse` with `return_lse=True`) must be given, and the query buffers that
+`quantize_mla_nvfp4_query(..., out=...)` fills are views of a uint8 workspace of
+`cake_backend.query_workspace_bytes(rows)` bytes
+(`cake_backend.mla_nvfp4_query_buffers(workspace, lead)`).
 
 **Toolkit requirement: CUDA 13.4 or newer.** The attention programs convert V
 with the Blackwell `QMUL4` instruction spelled in PTX ISA 9.4
@@ -58,7 +63,8 @@ an M128 N256 PV. The host plan (route, row tile, split count, grids, reducer)
 depends only on the batch
 shape, the longest KV and the device's SM count; a split-KV merge kernel runs
 behind the attention kernel (programmatic dependent launch) when the plan has
-more than one split. `prepare_cake_mla_nvfp4_paged_decode(...)` returns a
+more than one split (one template program for 1, 2 or 4 warps per row up to 32 splits, a
+CTA reducer above). `prepare_cake_mla_nvfp4_paged_decode(...)` returns a
 launch-only runner (`launch` allocates nothing; CUDA Graph ownership stays
 with the caller).
 
@@ -70,16 +76,22 @@ from flashinfer.mla import (
 )
 from flashinfer.experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
     max_workspace_bytes,
+    mla_nvfp4_query_buffers,
+    query_workspace_bytes,
 )
 
 batch, heads = 8, 12
 q = torch.randn(batch, 1, heads, 576, device="cuda", dtype=torch.bfloat16)
-q_nope, q_sf, q_rope, q_scale = quantize_mla_nvfp4_query(q, ckv_scale, kpe_scale)
+query_workspace = torch.empty(query_workspace_bytes(batch * heads), dtype=torch.uint8, device="cuda")
+q_nope, q_sf, q_rope, q_scale = quantize_mla_nvfp4_query(
+    q, ckv_scale, kpe_scale, out=mla_nvfp4_query_buffers(query_workspace, (batch, 1, heads))
+)
 workspace = torch.empty(max_workspace_bytes(batch * heads), dtype=torch.uint8, device="cuda")
-out = cake_mla_nvfp4_paged_decode(
+out = torch.empty(batch, 1, heads, 512, dtype=torch.bfloat16, device="cuda")
+cake_mla_nvfp4_paged_decode(
     q_nope, q_sf, q_rope, q_scale,
     ckv_cache, ckv_sf_cache, kpe_cache, block_tables, seq_lens, workspace,
-    sm_scale=1.0 / 192 ** 0.5, ckv_scale=ckv_scale,
+    sm_scale=1.0 / 192 ** 0.5, ckv_scale=ckv_scale, out=out,
 )
 ```
 

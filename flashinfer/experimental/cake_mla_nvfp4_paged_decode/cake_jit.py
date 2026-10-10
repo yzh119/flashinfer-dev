@@ -35,8 +35,8 @@ from ...jit.cpp_ext import get_cuda_version
 # split-KV merge; ``quantize``: the BF16 -> NVFP4 query quantizer),
 # ``COMPILE_FLAGS`` the extra nvcc flags per role, ``PROGRAMS`` every program
 # once with its role, sources and architectures, and ``KERNELS`` the logical
-# kernel key (``main_rt16`` / ``main_rt32`` / ``main_rt48``, ``reduce_w4`` /
-# ``reduce_w2`` / ``reduce_w1`` / ``reduce_cta``, ``quantize``) -> program.  The
+# kernel key (``main_rt16`` / ``main_rt32`` / ``main_rt48``, ``main_wide``, ``reduce_warp`` /
+# ``reduce_cta``, ``quantize``) -> program.  The
 # attention programs spell the Blackwell QMUL4 in PTX ISA 9.4 and carry
 # ``min_cuda_version``: the loader refuses an older toolkit.
 ARCHES = ("sm_100a", "sm_103a")
@@ -143,6 +143,24 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "reduce_warp": [
+        ["buffer", "partial_O"],
+        ["buffer", "partial_max"],
+        ["buffer", "partial_sum"],
+        ["buffer", "O"],
+        ["buffer", "lse"],
+        ["buffer", "cum_seq_lens_q"],
+        ["parameter", "batch"],
+        ["parameter", "num_heads"],
+        ["parameter", "num_split"],
+        ["parameter", "bmm2_scale"],
+        ["parameter", "lse_bias"],
+        ["parameter", "has_lse"],
+        ["parameter", "warps_per_row"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
 }
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mla_nvfp4_paged_decode_19c7a30a6bd596fcdaf0": {
@@ -153,14 +171,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a"],
         "min_cuda_version": "13.4",
-    },
-    "cake_mla_nvfp4_paged_decode_5a4a19965084fad614e0": {
-        "role": "reduce",
-        "sources": [
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_5a4a19965084fad614e0_kernel.cu",
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_5a4a19965084fad614e0_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_mla_nvfp4_paged_decode_a97a6e8c4568efb5162e": {
         "role": "main",
@@ -179,27 +189,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_mla_nvfp4_paged_decode_b5f228cb3d4ce228b91c": {
-        "role": "reduce",
-        "sources": [
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_b5f228cb3d4ce228b91c_kernel.cu",
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_b5f228cb3d4ce228b91c_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
     "cake_mla_nvfp4_paged_decode_c3e5c301c11cc04284c6": {
         "role": "reduce",
         "sources": [
             "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_c3e5c301c11cc04284c6_kernel.cu",
             "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_c3e5c301c11cc04284c6_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_mla_nvfp4_paged_decode_c9dcc7407b6c4b726b7d": {
-        "role": "reduce",
-        "sources": [
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_c9dcc7407b6c4b726b7d_kernel.cu",
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_c9dcc7407b6c4b726b7d_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -221,6 +215,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "min_cuda_version": "13.4",
     },
+    "cake_mla_nvfp4_paged_decode_split_reduce_warp": {
+        "role": "reduce",
+        "sources": [
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_split_reduce_warp_kernel.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_split_reduce_warp_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
 }
 KERNELS: dict[str, str] = {
     "main_rt16": "cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161",
@@ -229,9 +231,7 @@ KERNELS: dict[str, str] = {
     "main_wide": "cake_mla_nvfp4_paged_decode_e7cb458f5e586352cfcb",
     "quantize": "cake_mla_nvfp4_paged_decode_a9bf6a63f937e7cacaba",
     "reduce_cta": "cake_mla_nvfp4_paged_decode_c3e5c301c11cc04284c6",
-    "reduce_w1": "cake_mla_nvfp4_paged_decode_5a4a19965084fad614e0",
-    "reduce_w2": "cake_mla_nvfp4_paged_decode_c9dcc7407b6c4b726b7d",
-    "reduce_w4": "cake_mla_nvfp4_paged_decode_b5f228cb3d4ce228b91c",
+    "reduce_warp": "cake_mla_nvfp4_paged_decode_split_reduce_warp",
 }
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#4644"
 
