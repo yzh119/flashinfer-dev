@@ -77,4 +77,5 @@ union MmaSmemDesc {
 #include "cake_device_helpers/cake_add_f32x2_74578aa6314ab32b.cuh"
 #include "cake_device_helpers/cake_fma_f32x2_35fce702230b2007.cuh"
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
+#include "cake_device_helpers/cake_tma_store_3d_a0d668161ec63906.cuh"
 #include "cake_device_helpers/cake_tcgen05_commit_cg2_multicast_69baaeec12170a11.cuh"

@@ -28,7 +28,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_mla_nvfp4_paged_decode_6f1a02023e9c749c14e7(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, float* __restrict__ lse, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, float lse_bias, int has_lse)
+kernel_cake_mla_nvfp4_paged_decode_b5f228cb3d4ce228b91c(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, float* __restrict__ lse, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, float lse_bias, int has_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -60,45 +60,11 @@ kernel_cake_mla_nvfp4_paged_decode_6f1a02023e9c749c14e7(__nv_bfloat16* __restric
     if (row < rows_total) {
         int stat_base = row * num_split;
         int w_base = warp * 256;
-        float m_loc = -CAKE_INF;
-        for (int s = lane; s < num_split; s += 32) {
-            float m_s = partial_max[stat_base + s];
-            float _max_0 = max_noftz(m_loc, m_s);
-            m_loc = _max_0;
-        }
-        float _warp_reduce_0 = m_loc;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-        float max_m = _warp_reduce_0;
-        float w_loc = 0.0f;
-        for (int s_1 = lane; s_1 < num_split; s_1 += 32) {
-            float m_s2 = partial_max[stat_base + s_1];
-            float sum_s = partial_sum[stat_base + s_1];
-            float w_s = 0.0f;
-            if (sum_s > 0.0f) {
-                float _exp2_0 = approx_exp2(m_s2 - max_m);
-                w_s = _exp2_0 * sum_s;
-            }
-            smem_w[w_base + s_1] = w_s;
-            w_loc = w_loc + w_s;
-        }
-        float _warp_reduce_1 = w_loc;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
-        float sum_w = _warp_reduce_1;
-        __syncwarp();
-        float inv_sum = 0.0f;
-        if (sum_w > 0.0f) {
-            float _rcp_0 = approx_rcp(sum_w);
-            inv_sum = _rcp_0 * bmm2_scale;
-        }
         int d0 = part * 128 + lane * 4;
         int last_split = num_split - 1;
-        float pf[32];
+        float pf[64];
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
+        for (int j = 0; j < 16; j++) {
             if (last_split >= j) {
                 #pragma unroll
                 for (int q = 0; q < 4; q += 8) {
@@ -115,13 +81,41 @@ kernel_cake_mla_nvfp4_paged_decode_6f1a02023e9c749c14e7(__nv_bfloat16* __restric
                 }
             }
         }
+        int s_idx = lane;
+        int s_ld = ((s_idx > last_split) ? last_split : s_idx);
+        float m_raw = partial_max[stat_base + s_ld];
+        float sum_raw = partial_sum[stat_base + s_ld];
+        float m_s = ((sum_raw > 0.0f) ? m_raw : -CAKE_INF);
+        m_s = ((s_idx > last_split) ? -CAKE_INF : m_s);
+        float _warp_reduce_0 = m_s;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float max_m = _warp_reduce_0;
+        float w_s = 0.0f;
+        if (m_s > -CAKE_INF) {
+            float _exp2_0 = approx_exp2(m_s - max_m);
+            w_s = _exp2_0 * sum_raw;
+        }
+        smem_w[w_base + s_idx] = w_s;
+        float _warp_reduce_1 = w_s;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float sum_w = _warp_reduce_1;
+        __syncwarp();
+        float inv_sum = 0.0f;
+        if (sum_w > 0.0f) {
+            float _rcp_0 = approx_rcp(sum_w);
+            inv_sum = _rcp_0 * bmm2_scale;
+        }
         float acc[4];
         #pragma unroll
         for (int e = 0; e < 4; e++) {
             acc[e] = 0.0f;
         }
         #pragma unroll
-        for (int j_1 = 0; j_1 < 8; j_1++) {
+        for (int j_1 = 0; j_1 < 16; j_1++) {
             float w_raw_j = smem_w[w_base + j_1];
             float w_j = ((last_split >= j_1) ? w_raw_j : 0.0f);
             #pragma unroll
@@ -131,7 +125,7 @@ kernel_cake_mla_nvfp4_paged_decode_6f1a02023e9c749c14e7(__nv_bfloat16* __restric
             }
         }
         #pragma unroll 4
-        for (int k = 8; k < num_split; k++) {
+        for (int k = 16; k < num_split; k++) {
             float w_k = smem_w[w_base + k];
             float _vec_load_0[4];
             {

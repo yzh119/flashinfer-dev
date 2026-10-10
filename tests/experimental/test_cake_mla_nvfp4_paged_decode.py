@@ -31,6 +31,7 @@ from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
     CKV_BYTES,
     LSE_BIAS,
+    MAIN_KWARGS,
     MAX_SPLITS,
     QK_DIM,
     ROPE,
@@ -50,6 +51,8 @@ from flashinfer.experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
     quantize_mla_nvfp4_query,
     rt_for_rows,
     use_wide_route,
+    wide_clusters_per_request,
+    wide_num_split,
     wide_tiles,
     workspace_bytes,
 )
@@ -702,6 +705,15 @@ def test_every_kernel_key_resolves_on_the_running_architecture():
     )
 
 
+def test_wide_argument_plan_carries_the_partial_o_tensor_map():
+    # The wide kernel's epilogue stores through ``tmap_po``; the row-tile kernels do not take it.
+    wide = [name for _kind, name in cake_jit.ARG_PLANS["main_wide"]]
+    narrow = [name for _kind, name in cake_jit.ARG_PLANS["main"]]
+    assert "tmap_po" in wide and "tmap_po" not in narrow
+    assert [n for n in wide if n != "tmap_po"] == narrow
+    assert "tmap_po" in MAIN_KWARGS
+
+
 # ---------------------------------------------------------------------------
 # CPU tests: host plan and workspace
 # ---------------------------------------------------------------------------
@@ -741,21 +753,28 @@ def test_plan_invariants(sm_count):
                 )
                 if use_wide_route(max_q_len * num_heads):
                     assert plan.wide and plan.main_kind == "main_wide"
-                    rt, m_tiles, ctas = (
-                        WIDE_BLOCK_M,
-                        wide_tiles(max_q_len * num_heads),
-                        WIDE_CLUSTER,
+                    rt, m_tiles = WIDE_BLOCK_M, wide_tiles(max_q_len * num_heads)
+                    clusters = wide_clusters_per_request(sm_count, batch)
+                    assert plan.wide_clusters == clusters
+                    assert plan.grid_main == (WIDE_CLUSTER * clusters, 1, batch)
+                    # the (tile, split) pieces divide evenly over the request's clusters unless the
+                    # split count is capped by the KV length or by MAX_SPLITS
+                    pieces = m_tiles * plan.num_split
+                    cap = max(1, (max_seq_len + 127) // 128 // 2)  # two tiles per split
+                    assert pieces % clusters == 0 or plan.num_split in (cap, MAX_SPLITS)
+                    assert plan.grid_main[0] * batch <= max(
+                        sm_count, WIDE_CLUSTER * batch
                     )
                 else:
                     assert not plan.wide and plan.main_kind == f"main_rt{plan.rt}"
-                    (rt, m_tiles), ctas = rt_for_rows(max_q_len * num_heads), 1
+                    rt, m_tiles = rt_for_rows(max_q_len * num_heads)
+                    assert plan.grid_main == (plan.num_split, m_tiles, batch)
+                    assert plan.num_split * batch * m_tiles <= max(
+                        sm_count, batch * m_tiles
+                    )
                 assert (plan.rt, plan.m_tiles) == (rt, m_tiles)
                 assert plan.rows_max == batch * max_q_len * num_heads
-                assert plan.grid_main == (ctas * plan.num_split, m_tiles, batch)
                 assert 1 <= plan.num_split <= MAX_SPLITS
-                assert ctas * plan.num_split * batch * m_tiles <= max(
-                    sm_count, ctas * batch * m_tiles
-                )
                 if plan.num_split >= 33:
                     assert plan.reduce_kind == "reduce_cta" and plan.grid_reduce == (
                         plan.rows_max,
@@ -783,7 +802,7 @@ def test_plan_invariants(sm_count):
     )
     # 8 x 12 = 96 rows per request: the wide route, one 128-row cluster per (split, request).
     assert ragged.wide and ragged.rows_max == 156
-    assert ragged.grid_main == (WIDE_CLUSTER * ragged.num_split, 1, 3)
+    assert ragged.grid_main == (WIDE_CLUSTER * ragged.wide_clusters, 1, 3)
     with pytest.raises(ValueError, match="rows must be"):
         plan_mla_nvfp4_paged_decode(
             batch=1, max_q_len=1, num_heads=12, max_seq_len=64, sm_count=152, rows=13
@@ -806,17 +825,23 @@ def test_wide_route_selection():
     plan = plan_mla_nvfp4_paged_decode(
         batch=8, max_q_len=1, num_heads=96, max_seq_len=342305, sm_count=152
     )
-    assert (
-        plan.wide
-        and plan.main_kind == "main_wide"
-        and plan.rt == WIDE_BLOCK_M
-        and plan.m_tiles == 1
+    assert plan.wide and plan.main_kind == "main_wide"
+    assert plan.rt == WIDE_BLOCK_M and plan.m_tiles == 1
+    # 76 SM pairs over 8 requests: 9 clusters each, one (tile, split) piece per cluster
+    assert plan.wide_clusters == 9 and plan.num_split == 9
+    assert plan.grid_main == (WIDE_CLUSTER * 9, 1, 8) and plan.lse_bias == WIDE_LSE_BIAS
+    mtp = plan_mla_nvfp4_paged_decode(
+        batch=8, max_q_len=2, num_heads=96, max_seq_len=342305, sm_count=152
     )
     assert (
-        plan.grid_main == (WIDE_CLUSTER * plan.num_split, 1, 8)
-        and plan.lse_bias == WIDE_LSE_BIAS
+        mtp.m_tiles == 2 and mtp.wide_clusters == 9 and mtp.num_split == 9
+    )  # 18 pieces, two per cluster
+    single = plan_mla_nvfp4_paged_decode(
+        batch=1, max_q_len=1, num_heads=128, max_seq_len=76800, sm_count=152
     )
-    assert plan.num_split * WIDE_CLUSTER * 8 <= 152
+    assert single.wide_clusters == 76 and single.num_split == 76
+    assert wide_num_split(9, 2, 2675, 256) == 9 and wide_num_split(9, 3, 2675, 256) == 3
+    assert wide_num_split(76, 1, 3, 256) == 3  # a short KV caps the split count
     narrow = plan_mla_nvfp4_paged_decode(
         batch=8, max_q_len=1, num_heads=48, max_seq_len=342305, sm_count=152
     )

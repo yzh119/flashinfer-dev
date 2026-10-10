@@ -89,6 +89,7 @@ WORKSPACE_ALIGNMENT = 16
 
 # Keyword names the stages are bound with (the registry's argument plans refer
 # to these names; ``_bind_stage`` orders them by the generated argument plan).
+# ``tmap_po`` is the wide kernel's alone: the row-tile programs' plans do not name it.
 MAIN_KWARGS = (
     "tmap_qn",
     "tmap_qs",
@@ -96,6 +97,7 @@ MAIN_KWARGS = (
     "tmap_k",
     "tmap_ks",
     "tmap_kr",
+    "tmap_po",
     "q_scale",
     "partial_O",
     "partial_max",
@@ -170,6 +172,19 @@ def wide_tiles(rows_per_request: int) -> int:
     return (rows_per_request + WIDE_BLOCK_M - 1) // WIDE_BLOCK_M
 
 
+def wide_clusters_per_request(sm_count: int, batch: int) -> int:
+    """Clusters (SM pairs) per request of the wide route: the machine's pairs shared evenly by the batch."""
+    return max(1, (sm_count // WIDE_CLUSTER) // max(1, batch))
+
+
+def wide_num_split(
+    clusters: int, m_tiles: int, max_pieces_by_len: int, max_splits: int
+) -> int:
+    """KV splits so that a request's ``m_tiles * num_split`` (tile, split) pieces divide evenly over its clusters."""
+    balanced = clusters // math.gcd(clusters, max(1, m_tiles))
+    return max(1, min(balanced, max_splits, max_pieces_by_len))
+
+
 def plan_num_split(items: int, max_seq_len: int, sm_count: int) -> int:
     """One CTA per SM per wave: fill the machine with (work item, split) pairs."""
     target = max(1, sm_count // max(1, items))
@@ -178,9 +193,10 @@ def plan_num_split(items: int, max_seq_len: int, sm_count: int) -> int:
 
 
 def reduce_warps_per_row(rows: int) -> int:
-    if rows <= 256:
+    """Warps per row of the warp reducer: more warps per row until the grid has at least ~3 CTAs per SM."""
+    if rows <= 512:
         return 4
-    if rows <= 1024:
+    if rows <= 2048:
         return 2
     return 1
 
@@ -200,6 +216,9 @@ class DecodePlan:
     reduce_warps: int  # 0 for the CTA reducer
     grid_reduce: tuple[int, int, int]
     wide: bool = False
+    wide_clusters: int = (
+        0  # clusters per request on the wide route (grid x = 2 * wide_clusters)
+    )
 
     @property
     def main_kind(self) -> str:
@@ -234,18 +253,28 @@ def plan_mla_nvfp4_paged_decode(
             f"rows must be in [1, batch * max_q_len * num_heads = {batch * max_q_len * num_heads}], got {rows_max}"
         )
     wide = use_wide_route(max_q_len * num_heads)
+    wide_clusters = 0
     if wide:
+        # Persistent wide clusters: C clusters per request take its (tile, split) pieces round-robin; the split
+        # count makes the pieces divide evenly over C.
         rt, m_tiles = WIDE_BLOCK_M, wide_tiles(max_q_len * num_heads)
-        ctas_per_item = WIDE_CLUSTER
+        wide_clusters = wide_clusters_per_request(sm_count, batch)
+        max_by_len = max(
+            1, (int(max_seq_len) + TILE_TOK - 1) // TILE_TOK // MIN_TILES_PER_SPLIT
+        )
+        splits = (
+            int(num_split)
+            if num_split
+            else wide_num_split(wide_clusters, m_tiles, max_by_len, MAX_SPLITS)
+        )
     else:
         rt, m_tiles = rt_for_rows(max_q_len * num_heads)
-        ctas_per_item = 1
-    items = batch * m_tiles
-    splits = (
-        int(num_split)
-        if num_split
-        else plan_num_split(items, int(max_seq_len), sm_count // ctas_per_item)
-    )
+        items = batch * m_tiles
+        splits = (
+            int(num_split)
+            if num_split
+            else plan_num_split(items, int(max_seq_len), sm_count)
+        )
     if not 1 <= splits <= MAX_SPLITS:
         raise ValueError(f"num_split must be in [1, {MAX_SPLITS}], got {splits}")
     if splits >= REDUCE_CTA_MIN_SPLITS:
@@ -261,11 +290,14 @@ def plan_mla_nvfp4_paged_decode(
         m_tiles=m_tiles,
         num_split=splits,
         rows_max=rows_max,
-        grid_main=(ctas_per_item * splits, m_tiles, batch),
+        grid_main=(WIDE_CLUSTER * wide_clusters, 1, batch)
+        if wide
+        else (splits, m_tiles, batch),
         reduce_kind=reduce_kind,
         reduce_warps=reduce_warps,
         grid_reduce=grid_reduce,
         wide=wide,
+        wide_clusters=wide_clusters,
     )
 
 
@@ -748,6 +780,7 @@ class CakeMlaNvfp4PagedDecode:
         self.reduce_program = (
             select_program(plan.reduce_kind, self.arch) if plan.num_split > 1 else None
         )
+        write_target = self.o_rows if plan.num_split == 1 else self.partial_O
         main_kwargs = dict(
             tmap_qn=q_nope.reshape(-1, CKV_BYTES),
             tmap_qs=q_sf.view(u8).reshape(-1, SF_BYTES),
@@ -755,8 +788,10 @@ class CakeMlaNvfp4PagedDecode:
             tmap_k=ckv_cache,
             tmap_ks=ckv_sf_cache.view(u8),
             tmap_kr=kpe_cache.view(u8),
+            # The wide epilogue's bulk stores: partial_O as [rows, num_split, 512], the output as [rows, 1, 512].
+            tmap_po=write_target.view(-1, plan.num_split, V_DIM),
             q_scale=q_scale.reshape(-1),
-            partial_O=self.o_rows if plan.num_split == 1 else self.partial_O,
+            partial_O=write_target,
             partial_max=self.partial_max,
             partial_sum=self.partial_sum,
             lse=lse_rows,
@@ -777,7 +812,7 @@ class CakeMlaNvfp4PagedDecode:
         )
         assert tuple(main_kwargs) == MAIN_KWARGS
         self._main_entry, self._main_arguments = _bind_stage(
-            "main", self.main_program, self.arch, main_kwargs
+            "main_wide" if plan.main_kind == "main_wide" else "main", self.main_program, self.arch, main_kwargs
         )
         self._reduce_entry: Optional[Callable[..., Any]] = None
         self._reduce_arguments: tuple = ()
@@ -925,6 +960,8 @@ __all__ = [
     "reduce_warps_per_row",
     "rt_for_rows",
     "use_wide_route",
+    "wide_clusters_per_request",
+    "wide_num_split",
     "wide_tiles",
     "workspace_bytes",
 ]

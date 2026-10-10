@@ -34,7 +34,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_mla_nvfp4_paged_decode_d0b9705bb5f3deafe9b7(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, float* __restrict__ lse, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, float lse_bias, int has_lse)
+kernel_cake_mla_nvfp4_paged_decode_c3e5c301c11cc04284c6(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, float* __restrict__ lse, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, float lse_bias, int has_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -72,9 +72,9 @@ kernel_cake_mla_nvfp4_paged_decode_d0b9705bb5f3deafe9b7(__nv_bfloat16* __restric
         int last_split = num_split - 1;
         int half = lane >> 4;
         int d0 = chunk * 128 + (lane & 15) * 8;
-        unsigned int pfw[12];
+        unsigned int pfw[20];
         #pragma unroll
-        for (int j = 0; j < 3; j++) {
+        for (int j = 0; j < 5; j++) {
             int s_pf = (j * 8 + warp) * 2 + half;
             if (s_pf <= last_split) {
                 {
@@ -141,7 +141,7 @@ kernel_cake_mla_nvfp4_paged_decode_d0b9705bb5f3deafe9b7(__nv_bfloat16* __restric
             acc[e] = 0.0f;
         }
         #pragma unroll
-        for (int j_1 = 0; j_1 < 3; j_1++) {
+        for (int j_1 = 0; j_1 < 5; j_1++) {
             int s_raw_p = (j_1 * 8 + warp) * 2 + half;
             int s_w_p = ((s_raw_p > last_split) ? last_split : s_raw_p);
             float w_raw_p = smem_w[s_w_p];
@@ -161,7 +161,7 @@ kernel_cake_mla_nvfp4_paged_decode_d0b9705bb5f3deafe9b7(__nv_bfloat16* __restric
         }
         int n_iter_w = (num_split + 16 - 1) / 16;
         #pragma unroll 8
-        for (int k = 3; k < n_iter_w; k++) {
+        for (int k = 5; k < n_iter_w; k++) {
             int s_raw = (k * 8 + warp) * 2 + half;
             int s_w_idx = ((s_raw > last_split) ? last_split : s_raw);
             float w_raw = smem_w[s_w_idx];

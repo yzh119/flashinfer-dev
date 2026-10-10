@@ -30,7 +30,8 @@ from ...jit.cpp_ext import get_cuda_version
 # Every program is one device translation unit plus its host binding, shared by
 # every architecture in ``ARCHES``; the loader compiles it with the exact flag
 # set of the device it runs on.  ``ARG_PLANS`` holds the one argument order per
-# stage role (``main``: the swapped-AB attention kernel; ``reduce``: the
+# stage role (``main``: the swapped-AB attention kernel; ``main_wide``: the two-CTA wide kernel, which adds the
+# ``tmap_po`` tensor map; ``reduce``: the
 # split-KV merge; ``quantize``: the BF16 -> NVFP4 query quantizer),
 # ``COMPILE_FLAGS`` the extra nvcc flags per role, ``PROGRAMS`` every program
 # once with its role, sources and architectures, and ``KERNELS`` the logical
@@ -95,6 +96,36 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "main_wide": [
+        ["tma_buffer", "tmap_qn"],
+        ["tma_buffer", "tmap_qs"],
+        ["tma_buffer", "tmap_qr"],
+        ["tma_buffer", "tmap_k"],
+        ["tma_buffer", "tmap_ks"],
+        ["tma_buffer", "tmap_kr"],
+        ["tma_buffer", "tmap_po"],
+        ["buffer", "q_scale"],
+        ["buffer", "partial_O"],
+        ["buffer", "partial_max"],
+        ["buffer", "partial_sum"],
+        ["buffer", "lse"],
+        ["buffer", "seq_lens"],
+        ["buffer", "kv_len_global"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "page_table"],
+        ["parameter", "softmax_scale_log2"],
+        ["parameter", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "num_split"],
+        ["parameter", "max_pages_per_seq"],
+        ["parameter", "page_shift"],
+        ["parameter", "cp_world"],
+        ["parameter", "cp_rank"],
+        ["parameter", "has_lse"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "reduce": [
         ["buffer", "partial_O"],
         ["buffer", "partial_max"],
@@ -123,28 +154,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "min_cuda_version": "13.4",
     },
-    "cake_mla_nvfp4_paged_decode_461fdb80f34f6610cafd": {
-        "role": "main",
-        "sources": [
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_461fdb80f34f6610cafd_cu134_kernel.cu",
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_461fdb80f34f6610cafd_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "min_cuda_version": "13.4",
-    },
-    "cake_mla_nvfp4_paged_decode_6f1a02023e9c749c14e7": {
+    "cake_mla_nvfp4_paged_decode_5a4a19965084fad614e0": {
         "role": "reduce",
         "sources": [
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_6f1a02023e9c749c14e7_kernel.cu",
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_6f1a02023e9c749c14e7_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_mla_nvfp4_paged_decode_98d7b856095fc8779a66": {
-        "role": "reduce",
-        "sources": [
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_98d7b856095fc8779a66_kernel.cu",
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_98d7b856095fc8779a66_binding.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_5a4a19965084fad614e0_kernel.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_5a4a19965084fad614e0_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -165,19 +179,27 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_mla_nvfp4_paged_decode_b2e4c5513e1d7e5618c0": {
+    "cake_mla_nvfp4_paged_decode_b5f228cb3d4ce228b91c": {
         "role": "reduce",
         "sources": [
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_b2e4c5513e1d7e5618c0_kernel.cu",
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_b2e4c5513e1d7e5618c0_binding.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_b5f228cb3d4ce228b91c_kernel.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_b5f228cb3d4ce228b91c_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_mla_nvfp4_paged_decode_d0b9705bb5f3deafe9b7": {
+    "cake_mla_nvfp4_paged_decode_c3e5c301c11cc04284c6": {
         "role": "reduce",
         "sources": [
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_d0b9705bb5f3deafe9b7_kernel.cu",
-            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_d0b9705bb5f3deafe9b7_binding.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_c3e5c301c11cc04284c6_kernel.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_c3e5c301c11cc04284c6_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_mla_nvfp4_paged_decode_c9dcc7407b6c4b726b7d": {
+        "role": "reduce",
+        "sources": [
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_c9dcc7407b6c4b726b7d_kernel.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_c9dcc7407b6c4b726b7d_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -190,17 +212,26 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "min_cuda_version": "13.4",
     },
+    "cake_mla_nvfp4_paged_decode_e7cb458f5e586352cfcb": {
+        "role": "main",
+        "sources": [
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_e7cb458f5e586352cfcb_cu134_kernel.cu",
+            "cake_mla_nvfp4_paged_decode/cake_mla_nvfp4_paged_decode_e7cb458f5e586352cfcb_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "min_cuda_version": "13.4",
+    },
 }
 KERNELS: dict[str, str] = {
     "main_rt16": "cake_mla_nvfp4_paged_decode_d2829e4e3bf495b79161",
     "main_rt32": "cake_mla_nvfp4_paged_decode_19c7a30a6bd596fcdaf0",
     "main_rt48": "cake_mla_nvfp4_paged_decode_a97a6e8c4568efb5162e",
-    "main_wide": "cake_mla_nvfp4_paged_decode_461fdb80f34f6610cafd",
+    "main_wide": "cake_mla_nvfp4_paged_decode_e7cb458f5e586352cfcb",
     "quantize": "cake_mla_nvfp4_paged_decode_a9bf6a63f937e7cacaba",
-    "reduce_cta": "cake_mla_nvfp4_paged_decode_d0b9705bb5f3deafe9b7",
-    "reduce_w1": "cake_mla_nvfp4_paged_decode_b2e4c5513e1d7e5618c0",
-    "reduce_w2": "cake_mla_nvfp4_paged_decode_98d7b856095fc8779a66",
-    "reduce_w4": "cake_mla_nvfp4_paged_decode_6f1a02023e9c749c14e7",
+    "reduce_cta": "cake_mla_nvfp4_paged_decode_c3e5c301c11cc04284c6",
+    "reduce_w1": "cake_mla_nvfp4_paged_decode_5a4a19965084fad614e0",
+    "reduce_w2": "cake_mla_nvfp4_paged_decode_c9dcc7407b6c4b726b7d",
+    "reduce_w4": "cake_mla_nvfp4_paged_decode_b5f228cb3d4ce228b91c",
 }
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#4644"
 
