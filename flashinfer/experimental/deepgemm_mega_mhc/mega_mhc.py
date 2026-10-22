@@ -207,6 +207,60 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "shared_sf_block_m": 0,
         "num_splits": [40],
     },
+    "cake_mega_mhc_5357915388c5040333c1": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_5357915388c5040333c1_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_5357915388c5040333c1_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_5357915388c5040333c1",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
 }
 ROUTES: list[dict[str, Any]] = [
     {
@@ -336,6 +390,15 @@ ROUTES: list[dict[str, Any]] = [
         "shared_sf": True,
         "program": "cake_mega_mhc_a5521c9dfaf81d2c0f1f",
         "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "bf16",
+        "program": "cake_mega_mhc_5357915388c5040333c1",
+        "defines": {},
     },
 ]
 ARG_PLAN: list[list[str]] = [
@@ -508,10 +571,10 @@ def device_facts(device_index):
     device = torch.device("cuda", device_index)
     capability = get_compute_capability(device)
     arch = CAPABILITIES.get(capability)
-    if arch is None or arch not in ARCHES:
+    if arch is None or arch not in shipped_arches():
         raise RuntimeError(
             f"Mega mHC has no exported programs for compute capability {capability}; "
-            f"supported: {ARCHES}"
+            f"supported: {shipped_arches()}"
         )
     return arch, get_device_sm_count(device)
 
@@ -519,6 +582,14 @@ def device_facts(device_index):
 def record_arches(record):
     """The architectures a program ships for: its own ``arches`` leaf, else ARCHES."""
     return list(record.get("arches", ARCHES))
+
+
+def shipped_arches():
+    """Every architecture some exported program ships for: the records' own
+    ``arches`` leaves, else ARCHES."""
+    return sorted(
+        {arch for record in PROGRAMS.values() for arch in record_arches(record)}
+    )
 
 
 def record_arg_plan(record):
@@ -966,6 +1037,7 @@ class MegaMHCPlan:
                 launch_epochs=launch_epochs,
                 num_tokens=tokens,
                 num_splits=splits,
+                split_div=splits,
                 num_ctas=launch_sms,
                 hc_norm_eps=hc_norm_eps,
                 hc_pre_eps=hc_pre_eps,
