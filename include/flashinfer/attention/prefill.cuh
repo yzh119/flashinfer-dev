@@ -3002,7 +3002,9 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                 group_size.divmod(qo_packed_idx_base + lane_idx / 4 + j * 8 + mma_q * 16, q, r);
                 const uint32_t qo_head_idx = kv_head_idx * group_size + r;
                 const uint32_t qo_idx = q;
-                if (qo_idx < qo_len) {
+                // The four lanes of a quad hold the same row's m and d after the quad reduction;
+                // one of them stores the row's LSE.
+                if (lane_idx % 4 == 0 && qo_idx < qo_len) {
                   if (partition_kv) {
                     lse[(qo_idx * num_chunks + chunk_idx) * num_qo_heads + qo_head_idx] =
                         math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
@@ -3788,7 +3790,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                 group_size.divmod(qo_packed_idx_base + lane_idx / 4 + j * 8 + mma_q * 16, q, r);
                 const uint32_t qo_head_idx = kv_head_idx * group_size + r;
                 const uint32_t qo_idx = q;
-                if (qo_idx < qo_len) {
+                // The four lanes of a quad hold the same row's m and d after the quad reduction;
+                // one of them stores the row's LSE.
+                if (lane_idx % 4 == 0 && qo_idx < qo_len) {
                   if (partition_kv) {
                     lse[(o_indptr[request_idx] + qo_idx * num_kv_chunks + kv_tile_idx) *
                             num_qo_heads +
@@ -4758,7 +4762,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 group_size.divmod(qo_packed_idx_base + lane_idx / 4 + j * 8 + mma_q * 16, q, r);
                 const uint32_t qo_head_idx = kv_head_idx * group_size + r;
                 const uint32_t qo_idx = q;
-                if (qo_idx < qo_upper_bound) {
+                // The four lanes of a quad hold the same row's m and d after the quad reduction;
+                // one of them stores the row's LSE.
+                if (lane_idx % 4 == 0 && qo_idx < qo_upper_bound) {
                   if (partition_kv) {
                     lse[(o_indptr[request_idx] + qo_idx * num_kv_chunks + kv_tile_idx) *
                             num_qo_heads +

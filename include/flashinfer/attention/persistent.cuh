@@ -487,7 +487,9 @@ struct BlockBatchPagedAttentionPersistent {
               uint32_t q, r;
               const uint32_t packed_qo_idx = qo_packed_idx_base + lane_idx / 4 + j * 8 + mma_q * 16;
               gqa_group_size.divmod(packed_qo_idx, q, r);
-              if (q < qo_upperbound) {
+              // The four lanes of a quad hold the same row's m and d after the quad reduction;
+              // one of them stores the row's LSE.
+              if (lane_idx % 4 == 0 && q < qo_upperbound) {
                 if (num_kv_chunks > 1) {
                   partial_lse[(o_indptr + (packed_qo_idx - packed_qo_start) * num_kv_chunks +
                                kv_chunk_idx) *
