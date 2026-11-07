@@ -1244,6 +1244,12 @@ def _fp8_h64_m64_program(sparse_topk: int) -> str:
     return "fp8_h64_prefill_source_persistent_m64_multi_tile"
 
 
+# Architectures that build neither FP8 source-exact body
+# (``fp8_h64_source_exact``, ``fp8_h8_h16_source_exact``): their shape-locked
+# rows run the M64 body there, as the neighbouring rows do.
+_FP8_NO_SOURCE_EXACT_ARCHES = frozenset({"sm_107a"})
+
+
 # Architectures that build the H64 cluster body (``fp8_lowhead_h64``) and route
 # rows to it; SM107 registers no program for it, and SM103 runs its rows on the
 # persistent body (``_FP8_H64_PERSISTENT_PARTIAL_THIRD_ARCHES``).
@@ -1555,6 +1561,7 @@ def _route(
             raise ValueError(f"unsupported CAKE FP8 DSv4 head count: {num_heads}")
         if (
             num_heads == 64
+            and arch not in _FP8_NO_SOURCE_EXACT_ARCHES
             and batch_size == 2
             and max_q_len == 257
             and ragged
@@ -1576,6 +1583,7 @@ def _route(
             return _fp8_h64_m64_program(sparse_topk)
         if (
             num_heads in (8, 16)
+            and arch not in _FP8_NO_SOURCE_EXACT_ARCHES
             and batch_size == 3
             and max_q_len == 5
             and ragged

@@ -2905,6 +2905,80 @@ def test_fp8_lowhead_narrow_decode_rows_leave_one_partition_past_one_wave(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "num_heads, batch_size, max_q_len, sparse_topk, page_size",
+    [
+        (8, 3, 5, 192, 64),
+        (8, 3, 5, 260, 2),
+        (16, 3, 5, 256, 64),
+        (16, 3, 5, 260, 2),
+        (64, 2, 257, 640, 64),
+    ],
+)
+def test_fp8_source_exact_rows_take_the_m64_body_on_sm107(
+    num_heads, batch_size, max_q_len, sparse_topk, page_size
+):
+    """The shape-locked rows of the FP8 source-exact bodies run them on SM100
+    and SM103; SM107 builds neither body and runs the rows on the M64 body."""
+    tokens = batch_size * max_q_len - 1
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        route = _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=num_heads,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            ragged=True,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=tokens,
+            sm_count=_SM107_SM_COUNT if arch == "sm_107a" else _SM_COUNT,
+            arch=arch,
+        )
+        if arch == "sm_107a":
+            assert route == "fp8_h64_prefill_source_persistent_m64_multi_tile"
+        else:
+            assert route.endswith("_source_exact"), (arch, route)
+        assert route in _ARCH_REGISTRATIONS[arch]["variants"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 64, 128])
+@pytest.mark.parametrize("swa", [True, False])
+def test_fp8_sm107_routes_name_programs_sm107_builds(num_heads, swa):
+    """Every FP8 row SM107 accepts routes to a program SM107 registers."""
+    variants = _ARCH_REGISTRATIONS["sm_107a"]["variants"]
+    widths = (128,) if swa else (132, 192, 256, 260, 320, 384, 385, 640, 1152)
+    shapes = ((1, False), (4, False), (5, True), (257, True))
+    for sparse_topk in widths:
+        for page_size in (2, 64):
+            for tokens in (1, 12, 14, 48, 108, 109, 216, 512, 2048):
+                for max_q_len, ragged in shapes:
+                    if max_q_len > tokens:
+                        continue
+                    for kv4 in (False, True):
+                        route = _route(
+                            dtype=torch.float8_e4m3fn,
+                            num_heads=num_heads,
+                            batch_size=-(-tokens // max_q_len),
+                            max_q_len=max_q_len,
+                            ragged=ragged,
+                            sparse_topk=sparse_topk,
+                            compressed_page_size=0 if swa else page_size,
+                            num_query_tokens=tokens,
+                            sm_count=_SM107_SM_COUNT,
+                            arch="sm_107a",
+                            kv4=kv4,
+                        )
+                        assert route in variants, (
+                            sparse_topk,
+                            page_size,
+                            tokens,
+                            max_q_len,
+                            route,
+                        )
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
 @pytest.mark.parametrize("num_heads", [8, 16, 32])
 @pytest.mark.parametrize("sm_count", [_SM_COUNT, 152, _SM107_SM_COUNT])
